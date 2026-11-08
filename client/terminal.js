@@ -13,9 +13,13 @@ if (isMobile) {
   document.body.classList.add('is-mobile');
 }
 
-// Retrieve token from local storage
-const token = localStorage.getItem('conduit_token');
-if (!token) {
+// URL parameters & authentication token handling
+const urlParams = new URLSearchParams(window.location.search);
+const tokenParam = urlParams.get('token');
+let token = localStorage.getItem('conduit_token');
+
+// If neither URL token nor stored token exists, immediately redirect to login
+if (!tokenParam && !token) {
   window.location.href = '/';
   throw new Error('Redirecting: no auth token.');
 }
@@ -471,8 +475,47 @@ window.addEventListener('online', () => {
   }
 });
 
+// Initialize authentication (exchanging URL token if present) and connect
+async function initializeTerminalAuth() {
+  if (tokenParam && tokenParam.trim()) {
+    try {
+      const response = await fetch('/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ token: tokenParam.trim() })
+      });
+      const data = await response.json();
+      if (response.ok && data.token) {
+        token = data.token;
+        localStorage.setItem('conduit_token', data.token);
+        // Strip sensitive token from URL while preserving other query params (e.g. mobile=1)
+        urlParams.delete('token');
+        const remainingQuery = urlParams.toString() ? '?' + urlParams.toString() : '';
+        window.history.replaceState({}, document.title, window.location.pathname + remainingQuery);
+        connectWebSocket();
+        return;
+      }
+    } catch (err) {
+      console.error('Direct token authentication error:', err);
+    }
+    // Failed token authentication: clear token and redirect to login screen
+    localStorage.removeItem('conduit_token');
+    window.location.href = '/';
+    return;
+  }
+
+  if (!token) {
+    window.location.href = '/';
+    return;
+  }
+
+  connectWebSocket();
+}
+
 // Start the initial connection on startup
-connectWebSocket();
+initializeTerminalAuth();
 
 // Handle user typing:
 // (4) Spec Fix: Sticky CTRL hooks onData, converts only single-char data, else clears and passes through.

@@ -35,24 +35,26 @@
   </div>
 
   <script>
-    // Auto-redirect if already logged in
-    const existingToken = localStorage.getItem('conduit_token');
-    if (existingToken) {
-      window.location.href = '/term';
-    }
-
     const form = document.getElementById('login-form');
     const input = document.getElementById('token-input');
     const card = document.getElementById('login-card');
     const errorMsg = document.getElementById('error-message');
+    const submitBtn = document.getElementById('submit-btn');
+    const subtitle = document.querySelector('.subtitle');
+    const inputGroup = document.querySelector('.input-group');
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
+    async function authenticate(token, isAuto = false) {
       errorMsg.textContent = '';
       card.classList.remove('shake');
-      
-      const token = input.value.trim();
-      if (!token) return;
+      if (submitBtn) {
+        submitBtn.disabled = true;
+      }
+
+      if (isAuto) {
+        if (subtitle) subtitle.textContent = 'Connecting directly to terminal...';
+        if (inputGroup) inputGroup.style.display = 'none';
+        if (submitBtn) submitBtn.style.display = 'none';
+      }
 
       try {
         const response = await fetch('/auth/login', {
@@ -67,13 +69,40 @@
 
         if (response.ok && data.token) {
           localStorage.setItem('conduit_token', data.token);
-          window.location.href = '/term';
+          // Preserve any extra query parameters (e.g. mobile=1) while stripping the token secret
+          const targetParams = new URLSearchParams(window.location.search);
+          targetParams.delete('token');
+          const remainingQuery = targetParams.toString() ? '?' + targetParams.toString() : '';
+          window.location.replace('/term' + remainingQuery);
         } else {
+          if (isAuto) {
+            if (subtitle) subtitle.textContent = 'Secure WSL Remote Terminal Access';
+            if (inputGroup) inputGroup.style.display = '';
+            if (submitBtn) submitBtn.style.display = '';
+          }
+          if (submitBtn) {
+            submitBtn.disabled = false;
+          }
           showError(data.error || 'Access denied');
         }
       } catch (err) {
+        if (isAuto) {
+          if (subtitle) subtitle.textContent = 'Secure WSL Remote Terminal Access';
+          if (inputGroup) inputGroup.style.display = '';
+          if (submitBtn) submitBtn.style.display = '';
+        }
+        if (submitBtn) {
+          submitBtn.disabled = false;
+        }
         showError('Network error. Failed to reach server.');
       }
+    }
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const token = input.value.trim();
+      if (!token) return;
+      authenticate(token, false);
     });
 
     function showError(msg) {
@@ -83,6 +112,18 @@
       card.classList.add('shake');
       input.value = '';
       input.focus();
+    }
+
+    // Auto-login if token is provided in URL query string, otherwise auto-redirect if already logged in
+    const urlParams = new URLSearchParams(window.location.search);
+    const tokenParam = urlParams.get('token');
+    if (tokenParam && tokenParam.trim()) {
+      authenticate(tokenParam.trim(), true);
+    } else {
+      const existingToken = localStorage.getItem('conduit_token');
+      if (existingToken) {
+        window.location.href = '/term';
+      }
     }
   </script>
 </body>

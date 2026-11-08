@@ -36,21 +36,23 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve client directory statically
-app.use(express.static(path.join(__dirname, '../client')));
+// Redirect root to index.html (login screen), preserving query parameters (e.g. ?token=...)
+app.get('/', (req, res) => {
+  const query = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+  res.redirect('/index.html' + query);
+});
+
+// Redirect /term to terminal.html, preserving query parameters
+app.get('/term', (req, res) => {
+  const query = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+  res.redirect('/terminal.html' + query);
+});
 
 // Mount auth router
 app.use('/auth', authRouter);
 
-// Redirect root to index.html (login screen)
-app.get('/', (req, res) => {
-  res.redirect('/index.html');
-});
-
-// Redirect /term to terminal.html
-app.get('/term', (req, res) => {
-  res.redirect('/terminal.html');
-});
+// Serve client directory statically
+app.use(express.static(path.join(__dirname, '../client')));
 
 // Handle connection upgrade to /terminal WebSocket
 server.on('upgrade', (request, socket, head) => {
@@ -223,13 +225,16 @@ server.listen(config.PORT, '0.0.0.0', async () => {
   console.log(chalk.green('╚' + '═'.repeat(63) + '╝'));
   console.log('');
 
+  const localAuthUrl = `${localUrl}/?token=${encodeURIComponent(config.AUTH_SECRET)}`;
+  const publicAuthUrl = publicUrl ? `${publicUrl}/?token=${encodeURIComponent(config.AUTH_SECRET)}` : null;
+
   // ── Local QR Code ──────────────────────────────────────────────────────────
   console.log(chalk.cyan('  ▸ Local Network QR Code:'));
-  qrcode.generate(localUrl, { small: true });
+  qrcode.generate(localAuthUrl, { small: true });
 
   // ── Public QR Code ─────────────────────────────────────────────────────────
-  if (publicUrl) {
+  if (publicAuthUrl) {
     console.log(chalk.cyan('  ▸ Public (Cloudflare) QR Code:'));
-    qrcode.generate(publicUrl, { small: true });
+    qrcode.generate(publicAuthUrl, { small: true });
   }
 });
