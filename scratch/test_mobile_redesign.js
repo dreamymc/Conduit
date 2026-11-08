@@ -231,14 +231,18 @@ assert.deepStrictEqual(sentInputs, ['\x1bOB', '\x1bOB']);
 let selectedArgs = null;
 mockTerm.select = (col, row, len) => { selectedArgs = { col, row, len }; };
 // Touch on 'status' in 'git status --short' (cols 4..9)
+let copyModeTransitions = [];
+tc.onCopyModeChange = (active) => copyModeTransitions.push(active);
 tc._triggerCopyMode(70, 30); // coordinates inside cell for word 'status'
 assert.notStrictEqual(selectedArgs, null);
 assert.strictEqual(selectedArgs.row, 101, 'Copy Mode select must use absolute buffer row (viewportY + row)');
 assert.strictEqual(selectedArgs.col, 4, 'Word lookup start column for "status" must be 4');
 assert.strictEqual(selectedArgs.len, 6, 'Word length for "status" must be 6');
 assert.strictEqual(tc.isCopyModeActive, true);
+assert.deepStrictEqual(copyModeTransitions, [true], 'Triggering Copy Mode must notify onCopyModeChange(true)');
 tc.hideCopyPill();
 assert.strictEqual(tc.isCopyModeActive, false);
+assert.deepStrictEqual(copyModeTransitions, [true, false], 'Hiding Copy Mode must notify onCopyModeChange(false)');
 
 // 4.7 Round-trip pan (>10px moved, ended <10px from start) must NOT call term.focus()
 focusCalled = false;
@@ -283,23 +287,22 @@ tc._handleTouchMove({ touches: [{ clientX: 55, clientY: 55 }], preventDefault: (
 assert.strictEqual(tc.isCopyModeActive, true, 'Micro-movement <= 10px must retain Copy Mode');
 assert.strictEqual(scrolledLines, null, 'Micro-movement <= 10px must not scroll');
 
-// 4. Touchmove > 10px must dismiss Copy Mode, cancel timer, and scroll terminal
+// 4. Touchmove > 10px must dismiss Copy Mode and cancel timer, but must NOT scroll (screen drag scroll disabled)
 tc._handleTouchMove({ touches: [{ clientX: 50, clientY: 100 }], preventDefault: () => {} });
 assert.strictEqual(tc.isCopyModeActive, false, 'Touchmove > 10px must dismiss Copy Mode');
 assert.strictEqual(tc.longPressTriggered, false, 'Touchmove > 10px must clear longPressTriggered');
-assert.notStrictEqual(scrolledLines, null, 'Touchmove > 10px after long-press must scroll');
-assert.strictEqual(scrolledLines < 0, true, 'Dragging down must scroll up');
+assert.strictEqual(scrolledLines, null, 'Dragging on terminal must NOT scroll terminal (screen drag scroll disabled)');
 
-// 5. Dragging up after long-press must scroll down
+// 5. Dragging up on terminal must also NOT scroll
 scrolledLines = null;
 tc._handleTouchMove({ touches: [{ clientX: 50, clientY: 40 }], preventDefault: () => {} });
-assert.notStrictEqual(scrolledLines, null, 'Dragging up must scroll');
-assert.strictEqual(scrolledLines > 0, true, 'Dragging up must scroll down');
+assert.strictEqual(scrolledLines, null, 'Dragging up on terminal must NOT scroll terminal (screen drag scroll disabled)');
 
-// 6. Release after drag must NOT call term.focus()
+// 6. Release after drag must NOT call term.focus() and must NOT start momentum
 focusCalled = false;
 tc._handleTouchEnd({ changedTouches: [{ clientX: 50, clientY: 40 }] });
-assert.strictEqual(focusCalled, false, 'Release after long-press + drag must not focus');
+assert.strictEqual(focusCalled, false, 'Release after drag must not focus');
+assert.strictEqual(tc.animFrameId, null, 'Release after drag must not start momentum scrolling');
 
 // 7. Pausing stationary for >150ms before release must NOT trigger momentum
 tc.touchStartX = 50;
@@ -365,32 +368,11 @@ assert(Math.abs(fallbackVel - expectedFallback) < 1e-4, 'Fallback must use last 
 console.log('✓ Passed Touch Controller tests\n');
 
 // -----------------------------------------------------------------------------
-// Test 5: Power Sheet Component & Macros
+// Test 5: Middle-Mouse Scroll Ball Component
 // -----------------------------------------------------------------------------
-console.log('--- Test 5: Power Sheet & Macros ---');
-const powerSheetModule = require('../client/power-sheet.js');
-const { PowerSheet, DEFAULT_MACROS } = powerSheetModule;
+console.log('--- Test 5: Scroll Ball & Autoscroll Physics ---');
 
-assert(Array.isArray(DEFAULT_MACROS) && DEFAULT_MACROS.length === 3);
-
-// 5.1 Test macro persistence when list is empty
-const mockStorage = {
-  store: { 'conduit_macros': '[]' },
-  getItem: (k) => mockStorage.store[k] !== undefined ? mockStorage.store[k] : null,
-  setItem: (k, v) => { mockStorage.store[k] = String(v); }
-};
-global.localStorage = mockStorage;
-
-const psEmpty = new PowerSheet({ term: mockTerm });
-assert.deepStrictEqual(psEmpty.macros, [], 'Empty macros list in localStorage must NOT be overwritten with default macros');
-
-// 5.2 Test default macros loading when no storage exists
-delete mockStorage.store['conduit_macros'];
-const psDefault = new PowerSheet({ term: mockTerm });
-assert.strictEqual(psDefault.macros.length, 3);
-assert.strictEqual(psDefault.macros[0].name, 'git status');
-
-// 5.3 PowerSheet DOM interaction mock
+// DOM Mocks
 class MockClassList {
   constructor(el) {
     this.el = el;
@@ -423,6 +405,9 @@ class MockElement {
     this.listeners = {};
     this.innerHTMLText = '';
     this.value = '';
+    this.style = {};
+    this.parentNode = null;
+    this.textContent = '';
   }
   set id(val) { this.attributes['id'] = val; }
   get id() { return this.attributes['id'] || ''; }
@@ -432,7 +417,16 @@ class MockElement {
   get className() { return this.classList.toString(); }
   setAttribute(k, v) { this.attributes[k] = String(v); }
   getAttribute(k) { return this.attributes[k] !== undefined ? this.attributes[k] : null; }
-  appendChild(child) { this.children.push(child); return child; }
+  appendChild(child) {
+    child.parentNode = this;
+    this.children.push(child);
+    return child;
+  }
+  removeChild(child) {
+    this.children = this.children.filter(c => c !== child);
+    child.parentNode = null;
+    return child;
+  }
   addEventListener(event, fn) {
     if (!this.listeners[event]) this.listeners[event] = [];
     this.listeners[event].push(fn);
@@ -449,23 +443,65 @@ class MockElement {
   click() {
     this.dispatchEvent({ type: 'click', target: this, preventDefault: () => {}, stopPropagation: () => {} });
   }
+  getBoundingClientRect() {
+    return { left: 300, top: 200, width: 64, height: 64 };
+  }
+  closest(selector) {
+    let curr = this;
+    while (curr) {
+      if (selector.startsWith('.') && curr.classList && curr.classList.contains(selector.slice(1))) return curr;
+      if (curr.tagName && curr.tagName.toLowerCase() === selector.toLowerCase()) return curr;
+      curr = curr.parentNode;
+    }
+    return null;
+  }
   set innerHTML(html) {
     this.innerHTMLText = html;
     this.children = [];
-    // Basic mock parser for test buttons
-    const btnRegex = /<button\s+([^>]*?)>([\s\S]*?)<\/button>/g;
+    const root = this;
+    let current = root;
+    const tagRegex = /<(\/)?([a-zA-Z0-9_-]+)([^>]*)>|([^<]+)/g;
     let match;
-    while ((match = btnRegex.exec(html)) !== null) {
-      const btn = new MockElement('button');
-      btn.textContent = match[2].trim();
-      const attrStr = match[1];
-      const attrRegex = /([a-zA-Z0-9_-]+)="([^"]*)"/g;
-      let aMatch;
-      while ((aMatch = attrRegex.exec(attrStr)) !== null) {
-        if (aMatch[1] === 'class') btn.className = aMatch[2];
-        else btn.setAttribute(aMatch[1], aMatch[2]);
+    while ((match = tagRegex.exec(html)) !== null) {
+      const isClosing = Boolean(match[1]);
+      const tagName = match[2];
+      const attrsStr = match[3];
+      const text = match[4];
+
+      if (text) {
+        if (text.trim()) {
+          current.textContent = (current.textContent || '') + text.trim();
+        }
+        continue;
       }
-      this.children.push(btn);
+
+      if (isClosing) {
+        if (current.parentNode) {
+          current = current.parentNode;
+        }
+      } else {
+        const el = new MockElement(tagName);
+        if (attrsStr) {
+          const attrRegex = /([a-zA-Z0-9_-]+)(?:="([^"]*)")?/g;
+          let aMatch;
+          while ((aMatch = attrRegex.exec(attrsStr)) !== null) {
+            const key = aMatch[1];
+            const val = aMatch[2] !== undefined ? aMatch[2] : '';
+            if (key === 'class') {
+              el.className = val;
+            } else if (key === 'id') {
+              el.id = val;
+            } else {
+              el.setAttribute(key, val);
+            }
+          }
+        }
+        current.appendChild(el);
+        const voidTags = ['input', 'img', 'br', 'hr', 'meta', 'link'];
+        if (!voidTags.includes(tagName.toLowerCase())) {
+          current = el;
+        }
+      }
     }
   }
   querySelector(selector) {
@@ -505,51 +541,191 @@ class MockElement {
   }
 }
 
+const windowListeners = {};
+global.window = {
+  innerWidth: 375,
+  innerHeight: 667,
+  addEventListener: (event, fn) => {
+    if (!windowListeners[event]) windowListeners[event] = [];
+    windowListeners[event].push(fn);
+  },
+  removeEventListener: (event, fn) => {
+    if (windowListeners[event]) {
+      windowListeners[event] = windowListeners[event].filter(f => f !== fn);
+    }
+  },
+  dispatchEvent: (event) => {
+    const list = windowListeners[event.type] || [];
+    for (const fn of list) fn(event);
+  }
+};
+
 global.document = {
   createElement: (tag) => new MockElement(tag),
   getElementById: (id) => null,
   body: new MockElement('body')
 };
 
-let sheetSent = [];
-let sheetReconnectCalled = false;
-const testPS = new PowerSheet({
+const scrollBallModule = require('../client/scroll-ball.js');
+const { ScrollBall } = scrollBallModule;
+
+// 5.1 Test ScrollBall DOM rendering and structural layout
+let ballScrolledSteps = [];
+let ballSentInputs = [];
+let isHighlightedMock = false;
+
+const ball = new ScrollBall({
   term: mockTerm,
-  sendInput: (d) => sheetSent.push(d),
-  onReconnect: () => { sheetReconnectCalled = true; }
+  sendInput: (d) => ballSentInputs.push(d),
+  onScroll: (step) => ballScrolledSteps.push(step),
+  isHighlighted: () => isHighlightedMock,
+  maxRadius: 26,
+  deadzone: 4,
+  minScrollSpeed: 2,
+  maxScrollSpeed: 60
 });
-testPS.render();
 
-// Verify D-pad Up click sends cursor sequence honoring applicationCursorKeysMode
+const ballEl = ball.render();
+assert.notStrictEqual(ballEl, null);
+assert.strictEqual(ballEl.id, 'scroll-ball');
+assert.strictEqual(ball.nubEl !== null, true, 'ScrollBall must contain draggable nub element');
+assert.strictEqual(ballEl.querySelectorAll('.scroll-arrow.arrow-up').length, 1, 'ScrollBall must contain visual up arrow triangle');
+assert.strictEqual(ballEl.querySelectorAll('.scroll-arrow.arrow-down').length, 1, 'ScrollBall must contain visual down arrow triangle');
+
+// 5.2 Autoscroll Speed Calculation & Deadzone
+// Deadzone: movement <= 4px produces 0 speed
+assert.strictEqual(ball.calculateScrollSpeed(0), 0);
+assert.strictEqual(ball.calculateScrollSpeed(4), 0);
+assert.strictEqual(ball.calculateScrollSpeed(-4), 0);
+
+// Slight drag down (dy = 8px): small positive speed
+const slightDownSpeed = ball.calculateScrollSpeed(8);
+assert(slightDownSpeed > 0 && slightDownSpeed < 10, `Slight drag down must be slow positive speed (got ${slightDownSpeed})`);
+
+// Medium drag down (dy = 16px): moderate positive speed
+const mediumDownSpeed = ball.calculateScrollSpeed(16);
+assert(mediumDownSpeed > slightDownSpeed, 'Medium drag must be faster than slight drag');
+
+// Max drag down (dy = 26px): max speed 60 lines/sec
+const maxDownSpeed = ball.calculateScrollSpeed(26);
+assert.strictEqual(Math.round(maxDownSpeed), 60, 'Max drag down must reach maxScrollSpeed (60 lines/sec)');
+
+// Far drag must be significantly faster (non-linear acceleration)
+assert(maxDownSpeed > mediumDownSpeed * 1.5, 'Speed curve must accelerate non-linearly with distance');
+
+// Upward drag produces matching negative speeds (scrolling up)
+const slightUpSpeed = ball.calculateScrollSpeed(-8);
+assert.strictEqual(slightUpSpeed, -slightDownSpeed, 'Upward drag must produce equal and opposite speed to downward drag');
+const maxUpSpeed = ball.calculateScrollSpeed(-26);
+assert.strictEqual(maxUpSpeed, -maxDownSpeed, 'Max upward drag must reach -maxScrollSpeed');
+
+// 5.3 Continuous scrolling execution via displacement and animation step
+ballScrolledSteps = [];
+ball.isDragging = true;
+isHighlightedMock = false;
+
+// Simulate dragging nub down (dy = 26)
+ball.dy = 26;
+ball.lastScrollTime = 1000;
+// Advance 100ms: 60 lines/sec * 0.1s = 6 lines
+ball.lastScrollTime = 1000;
+ball._stepScroll();
+// Let scroll step accumulate
+ball.scrollAccumulator = 5.2;
+ball._stepScroll();
+assert(ballScrolledSteps.length > 0, 'Autoscroll loop must dispatch scroll steps');
+assert.strictEqual(ballScrolledSteps[0] > 0, true, 'Dragging nub down must dispatch positive scroll step (scroll down)');
+
+// Simulate dragging nub up (dy = -26)
+ballScrolledSteps = [];
+ball.dy = -26;
+ball.scrollAccumulator = -4.1;
+ball._stepScroll();
+assert(ballScrolledSteps.length > 0, 'Autoscroll loop must dispatch upward scroll steps');
+assert.strictEqual(ballScrolledSteps[0] < 0, true, 'Dragging nub up must dispatch negative scroll step (scroll up)');
+
+// 5.4 Release Snap-Back: Nub resets to (0,0) and scrolling stops immediately
+ball._resetNub();
+assert.strictEqual(ball.isDragging, false, 'Release must clear isDragging');
+assert.strictEqual(ball.dx, 0, 'Release must reset dx to 0');
+assert.strictEqual(ball.dy, 0, 'Release must reset dy to 0');
+assert.strictEqual(ball.animFrameId, null, 'Release must stop scroll animation frame loop');
+assert.strictEqual(ball.nubEl.style.transform, 'translate(0px, 0px)', 'Release must snap nub back to center');
+
+// 5.5 Text Highlighted Arrow Control Mode (Up, Down, Left, Right)
+isHighlightedMock = true;
+ballSentInputs = [];
 mockTerm.modes.applicationCursorKeysMode = false;
-sheetSent = [];
-const upBtn = testPS.element.querySelectorAll('.dpad-btn[data-dir]')[0];
-assert.strictEqual(upBtn.getAttribute('data-dir'), 'up');
-upBtn.click();
-assert.deepStrictEqual(sheetSent, ['\x1b[A'], 'D-pad Up click in normal mode must send \\x1b[A');
 
+// 1. Drag Up -> sends Up arrow (\x1b[A)
+ball.isDragging = true;
+ball._updateNubPosition(0, -20);
+assert.strictEqual(ball.activeArrowDirection, 'up');
+assert.deepStrictEqual(ballSentInputs, ['\x1b[A'], 'Dragging up in highlighted mode must send Up arrow sequence');
+
+// 2. Drag Down -> sends Down arrow (\x1b[B)
+ballSentInputs = [];
+ball._updateNubPosition(0, 20);
+assert.strictEqual(ball.activeArrowDirection, 'down');
+assert.deepStrictEqual(ballSentInputs, ['\x1b[B'], 'Dragging down in highlighted mode must send Down arrow sequence');
+
+// 3. Drag Left -> sends Left arrow (\x1b[D)
+ballSentInputs = [];
+ball._updateNubPosition(-20, 0);
+assert.strictEqual(ball.activeArrowDirection, 'left');
+assert.deepStrictEqual(ballSentInputs, ['\x1b[D'], 'Dragging left in highlighted mode must send Left arrow sequence');
+
+// 4. Drag Right -> sends Right arrow (\x1b[C)
+ballSentInputs = [];
+ball._updateNubPosition(20, 0);
+assert.strictEqual(ball.activeArrowDirection, 'right');
+assert.deepStrictEqual(ballSentInputs, ['\x1b[C'], 'Dragging right in highlighted mode must send Right arrow sequence');
+
+// 5. Application cursor keys mode honored
 mockTerm.modes.applicationCursorKeysMode = true;
-sheetSent = [];
-upBtn.click();
-assert.deepStrictEqual(sheetSent, ['\x1bOA'], 'D-pad Up click in app mode must send \\x1bOA');
+ballSentInputs = [];
+ball._updateNubPosition(0, -20);
+assert.deepStrictEqual(ballSentInputs, ['\x1bOA'], 'Dragging up in app mode must send \\x1bOA');
 
-// Verify symbol click sends symbol character
-sheetSent = [];
-const symbolBtns = testPS.element.querySelectorAll('.symbol-btn[data-sym]');
-assert(symbolBtns.length > 0);
-symbolBtns[0].click();
-assert.strictEqual(sheetSent.length, 1);
+// 6. Release in arrow mode stops repeating and resets nub
+ball._resetNub();
+assert.strictEqual(ball.isDragging, false);
+assert.strictEqual(ball.activeArrowDirection, null);
+assert.strictEqual(ball.arrowTimer, null);
+assert.strictEqual(ball.nubEl.style.transform, 'translate(0px, 0px)');
 
-// Verify macro run sends command and closes sheet
-sheetSent = [];
-testPS.open();
-assert.strictEqual(testPS.isOpen, true);
-const macroRunBtn = testPS.element.querySelectorAll('.macro-run-btn')[0];
-macroRunBtn.click();
-assert.strictEqual(sheetSent[0], 'git status\n');
-assert.strictEqual(testPS.isOpen, false, 'Running a macro must close the Power Sheet');
+// 5.6 Window listener cleanup & leak prevention
+ball._handlePointerDown({ clientX: 300, clientY: 200, preventDefault: () => {} });
+assert((windowListeners['pointermove'] || []).length > 0, 'Pointerdown must attach pointermove');
+ball._handlePointerUp({ preventDefault: () => {} });
+assert.strictEqual((windowListeners['pointermove'] || []).length, 0, 'Pointerup must remove pointermove listener (no leak)');
 
-console.log('✓ Passed Power Sheet tests\n');
+// 5.7 Drag mode locking: mid-drag selection clear must NOT flip into runaway autoscroll
+isHighlightedMock = true;
+ballScrolledSteps = [];
+ballSentInputs = [];
+ball._handlePointerDown({ clientX: 300, clientY: 200, preventDefault: () => {} });
+assert.strictEqual(ball.dragMode, 'arrow', 'Must start in arrow mode when highlighted');
+ball._handlePointerMove({ clientX: 300, clientY: 180, preventDefault: () => {} }); // drag up 20px
+assert.strictEqual(ball.activeArrowDirection, 'up');
+
+// Shell outputs and clears selection while user is still dragging
+isHighlightedMock = false;
+ball._handlePointerMove({ clientX: 300, clientY: 175, preventDefault: () => {} });
+assert.strictEqual(ball.dragMode, 'arrow', 'Must remain locked in arrow mode during active drag');
+assert.strictEqual(ball.animFrameId, null, 'Must NOT start autoscrolling mid-drag');
+assert.strictEqual(ballScrolledSteps.length, 0, 'Must NOT dispatch scroll steps in arrow mode');
+ball._resetNub();
+
+// 5.8 Visual arrow mode synchronization via syncArrowMode()
+isHighlightedMock = true;
+ball.syncArrowMode();
+assert.strictEqual(ballEl.classList.contains('arrow-mode'), true, 'syncArrowMode must add arrow-mode when highlighted');
+isHighlightedMock = false;
+ball.syncArrowMode();
+assert.strictEqual(ballEl.classList.contains('arrow-mode'), false, 'syncArrowMode must remove arrow-mode when selection cleared');
+
+console.log('✓ Passed Scroll Ball tests\n');
 
 // -----------------------------------------------------------------------------
 // Test 6: Server Terminal: 512KB Buffer, Max 10 Sessions & LRU Eviction (Spec Fix 7)
@@ -692,117 +868,118 @@ assert(detectedFg && detectedFg.includes('python'), `Must detect running child f
 console.log('✓ Passed Server Session Cap & LRU Eviction tests\n');
 
 // -----------------------------------------------------------------------------
-// Test 7: Jump-to-Bottom Pill (Req 6)
+// Test 7: Simplified 4-Button Mobile Dock ([ ENTER ], [ ESC ], [ COPY ], [ PASTE ])
 // -----------------------------------------------------------------------------
-console.log('--- Test 7: Jump-to-Bottom Pill (Req 6) ---');
+console.log('--- Test 7: Simplified 4-Button Mobile Dock ---');
 
-let scrollToBottomCalled = false;
-const jumpMockTerm = {
-  buffer: {
-    active: {
-      type: 'normal',
-      viewportY: 50,
-      baseY: 100
-    }
-  },
-  scrollToBottom: () => {
-    scrollToBottomCalled = true;
-    jumpMockTerm.buffer.active.viewportY = jumpMockTerm.buffer.active.baseY;
-  },
-  onScroll: (cb) => { jumpMockTerm._scrollCb = cb; },
-  _scrollCb: null
+let dockSent = [];
+let clipboardCopiedText = null;
+let clipboardPastedText = 'hello world';
+let termSelectionCleared = false;
+
+const dockMockTerm = {
+  hasSelection: () => true,
+  getSelection: () => 'git commit -m "fix"',
+  clearSelection: () => { termSelectionCleared = true; }
 };
 
-// Create mock pill element
-const pillEl = new MockElement('button');
-pillEl.id = 'jump-to-bottom-pill';
-pillEl.className = 'jump-to-bottom-pill hidden';
-
-const updatePill = () => {
-  const isNormal = Boolean(
-    jumpMockTerm.buffer &&
-    jumpMockTerm.buffer.active &&
-    jumpMockTerm.buffer.active.type === 'normal'
-  );
-  if (!isNormal) {
-    pillEl.classList.add('hidden');
-    return;
-  }
-  const isAtBottom = (jumpMockTerm.buffer.active.viewportY >= jumpMockTerm.buffer.active.baseY);
-  if (isAtBottom) {
-    pillEl.classList.add('hidden');
-  } else {
-    pillEl.classList.remove('hidden');
-  }
-};
-
-let pdPreventDefaultCalled = false;
-const handleJumpTap = (e) => {
-  if (e && typeof e.preventDefault === 'function') {
-    e.preventDefault();
-  }
-  if (jumpMockTerm.buffer && jumpMockTerm.buffer.active && jumpMockTerm.buffer.active.type === 'normal') {
-    jumpMockTerm.scrollToBottom();
-    updatePill();
-  }
-};
-pillEl.addEventListener('pointerdown', handleJumpTap);
-
-// 7.1 Normal buffer, scrolled up -> pill is visible
-updatePill();
-assert.strictEqual(pillEl.classList.contains('hidden'), false, 'Pill must be visible when scrolled up in normal buffer');
-
-// 7.2 Pointerdown calls preventDefault and scrolls to bottom
-pdPreventDefaultCalled = false;
-scrollToBottomCalled = false;
-pillEl.dispatchEvent({
-  type: 'pointerdown',
-  preventDefault: () => { pdPreventDefaultCalled = true; }
+const simplifiedDock = new MobileDock({
+  term: dockMockTerm,
+  sendInput: (d) => dockSent.push(d),
+  onCopy: () => { clipboardCopiedText = dockMockTerm.getSelection(); },
+  onPaste: () => { dockSent.push(clipboardPastedText); }
 });
-assert.strictEqual(pdPreventDefaultCalled, true, 'pointerdown on pill must call preventDefault to retain focus/keyboard');
-assert.strictEqual(scrollToBottomCalled, true, 'pointerdown must scroll terminal to bottom');
-assert.strictEqual(pillEl.classList.contains('hidden'), true, 'Pill must hide once scrolled to bottom');
 
-// 7.3 Alternate buffer -> pill must remain hidden even if viewportY < baseY
-jumpMockTerm.buffer.active.type = 'alternate';
-jumpMockTerm.buffer.active.viewportY = 10;
-jumpMockTerm.buffer.active.baseY = 100;
-updatePill();
-assert.strictEqual(pillEl.classList.contains('hidden'), true, 'Pill must NEVER show in alternate buffer');
+const renderedDock = simplifiedDock.render();
+assert.notStrictEqual(renderedDock, null);
 
-// 7.4 Alternate buffer: tapping does not scroll
-scrollToBottomCalled = false;
-pillEl.dispatchEvent({
-  type: 'pointerdown',
-  preventDefault: () => {}
+// 7.1 Dock must render exactly four buttons: ENTER, ESC, COPY, PASTE
+const dockButtons = renderedDock.querySelectorAll('.dock-btn');
+assert.strictEqual(dockButtons.length, 4, 'Mobile dock must contain exactly four buttons');
+
+const actions = dockButtons.map(b => b.getAttribute('data-action'));
+assert.deepStrictEqual(actions, ['enter', 'esc', 'copy', 'paste'], 'Buttons must be exactly [ ENTER ], [ ESC ], [ COPY ], [ PASTE ]');
+
+const labels = dockButtons.map(b => b.textContent.trim());
+assert.deepStrictEqual(labels, ['ENTER', 'ESC', 'COPY', 'PASTE'], 'Button labels must match exactly');
+
+// 7.2 Pointerdown on ENTER sends \r with preventDefault
+let enterPreventDefault = false;
+dockSent = [];
+simplifiedDock._handlePointerDown({
+  preventDefault: () => { enterPreventDefault = true; },
+  target: dockButtons[0]
 });
-assert.strictEqual(scrollToBottomCalled, false, 'Tapping pill in alternate buffer must not scroll');
+assert.strictEqual(enterPreventDefault, true, 'Pointerdown on ENTER must call preventDefault for virtual keyboard retention');
+assert.deepStrictEqual(dockSent, ['\r'], 'ENTER button must send \\r');
 
-// 7.5 Momentum cancellation when Jump-to-Bottom pill is activated
-let stopMomentumCalled = false;
-const mockTouchController = {
-  stopMomentum: () => { stopMomentumCalled = true; }
-};
-const handleJumpWithTouch = (e) => {
-  if (e && typeof e.preventDefault === 'function') {
-    e.preventDefault();
-  }
-  if (mockTouchController && typeof mockTouchController.stopMomentum === 'function') {
-    mockTouchController.stopMomentum();
-  }
-  if (jumpMockTerm.buffer && jumpMockTerm.buffer.active && jumpMockTerm.buffer.active.type === 'normal') {
-    jumpMockTerm.scrollToBottom();
-    updatePill();
-  }
-};
-jumpMockTerm.buffer.active.type = 'normal';
-jumpMockTerm.buffer.active.viewportY = 10;
-updatePill();
-stopMomentumCalled = false;
-handleJumpWithTouch({ preventDefault: () => {} });
-assert.strictEqual(stopMomentumCalled, true, 'Activating Jump-to-Bottom must stop running kinetic momentum');
+// 7.3 Pointerdown on ESC sends \x1b and clears terminal selection
+let escPreventDefault = false;
+dockSent = [];
+termSelectionCleared = false;
+simplifiedDock._handlePointerDown({
+  preventDefault: () => { escPreventDefault = true; },
+  target: dockButtons[1]
+});
+assert.strictEqual(escPreventDefault, true, 'Pointerdown on ESC must call preventDefault');
+assert.deepStrictEqual(dockSent, ['\x1b'], 'ESC button must send \\x1b');
+assert.strictEqual(termSelectionCleared, true, 'ESC button must clear terminal selection');
 
-console.log('✓ Passed Jump-to-Bottom Pill tests\n');
+// 7.4 Pointerdown on COPY copies selection and updates button text
+let copyPreventDefault = false;
+clipboardCopiedText = null;
+const copyBtn = dockButtons[2];
+simplifiedDock._handlePointerDown({
+  preventDefault: () => { copyPreventDefault = true; },
+  target: copyBtn
+});
+assert.strictEqual(copyPreventDefault, true, 'Pointerdown on COPY must call preventDefault');
+assert.strictEqual(clipboardCopiedText, 'git commit -m "fix"', 'COPY button must copy current terminal selection');
+assert.strictEqual(copyBtn.textContent, 'COPIED', 'COPY button must provide visual feedback');
+
+// 7.5 Pointerdown on PASTE reads clipboard and sends input
+let pastePreventDefault = false;
+dockSent = [];
+simplifiedDock._handlePointerDown({
+  preventDefault: () => { pastePreventDefault = true; },
+  target: dockButtons[3]
+});
+assert.strictEqual(pastePreventDefault, true, 'Pointerdown on PASTE must call preventDefault');
+assert.deepStrictEqual(dockSent, ['hello world'], 'PASTE button must send clipboard text as input');
+
+// 7.6 Deduplication: rapid click after pointerdown is ignored
+dockSent = [];
+simplifiedDock._handleClick({
+  target: dockButtons[0]
+});
+assert.strictEqual(dockSent.length, 0, 'Rapid click event after pointerdown must be ignored');
+
+// 7.7 COPY button does NOT show COPIED visual feedback when selection is empty
+const emptySelectionDock = new MobileDock({
+  term: { hasSelection: () => false, getSelection: () => '' },
+  sendInput: () => {}
+});
+const emptyDockEl = emptySelectionDock.render();
+const emptyCopyBtn = emptyDockEl.querySelectorAll('.dock-btn')[2];
+emptySelectionDock._handlePointerDown({
+  preventDefault: () => {},
+  target: emptyCopyBtn
+});
+assert.strictEqual(emptyCopyBtn.textContent, 'COPY', 'COPY button must not show COPIED when nothing is selected');
+
+// 7.8 PASTE button fallback when clipboard readText is rejected
+let promptCalled = false;
+global.window.prompt = (msg) => { promptCalled = true; return 'fallback text'; };
+dockSent = [];
+const fallbackDock = new MobileDock({
+  sendInput: (d) => dockSent.push(d)
+});
+// Trigger fallbackPaste directly
+fallbackDock._fallbackPaste();
+assert.strictEqual(promptCalled, true, 'PASTE button fallback must prompt user for text');
+assert.deepStrictEqual(dockSent, ['fallback text'], 'Fallback pasted text must be sent as input');
+
+console.log('✓ Passed Simplified 4-Button Mobile Dock tests\n');
 
 console.log('====================================================');
 console.log('ALL UNIT AND COMPONENT TESTS PASSED SUCCESSFULLY!');

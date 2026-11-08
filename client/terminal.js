@@ -125,120 +125,97 @@ resizeTerminal();
 
 // Initialize mobile subsystem components if mobile gating is active
 let mobileDock = null;
-let powerSheet = null;
+let scrollBall = null;
 let touchController = null;
-let jumpToBottomPillEl = null;
 
 function updateJumpToBottomVisibility() {
-  if (!jumpToBottomPillEl) return;
-  // (6) Spec Fix: normal buffer only
-  const isNormal = Boolean(
-    term &&
-    term.buffer &&
-    term.buffer.active &&
-    term.buffer.active.type === 'normal'
-  );
-  if (!isNormal) {
-    jumpToBottomPillEl.classList.add('hidden');
-    return;
-  }
-  const isAtBottom = (term.buffer.active.viewportY >= term.buffer.active.baseY);
-  if (isAtBottom) {
-    jumpToBottomPillEl.classList.add('hidden');
-  } else {
-    jumpToBottomPillEl.classList.remove('hidden');
-  }
+  // Safe no-op retained for terminal scroll listeners
 }
 
 if (isMobile) {
   const terminalContainerEl = document.getElementById('terminal-container');
 
-  // (6) Spec Fix: Jump-to-Bottom pill: normal buffer only, above the dock, pointerdown preventDefault
-  const jumpPill = document.createElement('button');
-  jumpPill.id = 'jump-to-bottom-pill';
-  jumpPill.className = 'jump-to-bottom-pill hidden';
-  jumpPill.setAttribute('type', 'button');
-  jumpPill.setAttribute('aria-label', 'Jump to bottom');
-  jumpPill.innerHTML = `
-    <span class="jump-icon">↓</span>
-    <span class="jump-label">Jump to bottom</span>
-  `;
-
-  const handleJump = (e) => {
-    e.preventDefault();
-    if (touchController && typeof touchController.stopMomentum === 'function') {
-      touchController.stopMomentum();
-    }
-    if (term.buffer && term.buffer.active && term.buffer.active.type === 'normal') {
-      term.scrollToBottom();
-      updateJumpToBottomVisibility();
-    }
-  };
-
-  // pointerdown preventDefault retains terminal focus and keeps virtual keyboard open
-  jumpPill.addEventListener('pointerdown', handleJump);
-  jumpPill.addEventListener('click', handleJump);
-
-  document.body.appendChild(jumpPill);
-  jumpToBottomPillEl = jumpPill;
-  updateJumpToBottomVisibility();
-
-  if (typeof term.onScroll === 'function') {
-    term.onScroll(updateJumpToBottomVisibility);
-  }
-  if (term.buffer && typeof term.buffer.onBufferChange === 'function') {
-    term.buffer.onBufferChange(updateJumpToBottomVisibility);
-  }
-
   if (window.TouchController && window.TouchController.TouchController) {
     touchController = new window.TouchController.TouchController(term, sendWsInput, {
-      container: terminalContainerEl
+      container: terminalContainerEl,
+      onCopyModeChange: () => {
+        if (scrollBall) scrollBall.syncArrowMode();
+      }
     });
+  }
+
+  if (window.ScrollBall && window.ScrollBall.ScrollBall) {
+    scrollBall = new window.ScrollBall.ScrollBall({
+      term: term,
+      sendInput: sendWsInput,
+      isHighlighted: () => {
+        if (touchController && touchController.isCopyModeActive) return true;
+        if (term && typeof term.hasSelection === 'function') return term.hasSelection();
+        return false;
+      },
+      onScroll: (step) => {
+        if (touchController && typeof touchController._routeScrollStep === 'function') {
+          touchController._routeScrollStep(step);
+        } else if (term && typeof term.scrollLines === 'function') {
+          term.scrollLines(step);
+        }
+      }
+    });
+    scrollBall.mount(document.body);
+
+    if (typeof term.onSelectionChange === 'function') {
+      term.onSelectionChange(() => {
+        if (scrollBall) scrollBall.syncArrowMode();
+      });
+    }
   }
 
   if (window.MobileDock && window.MobileDock.MobileDock) {
     mobileDock = new window.MobileDock.MobileDock({
-      sendInput: sendWsInput,
-      onTogglePowerSheet: (forceOpen) => {
-        if (!powerSheet) return;
-        if (forceOpen === true) {
-          powerSheet.open();
-        } else {
-          powerSheet.toggle();
-        }
-      }
-    });
-    mobileDock.mount(document.body);
-  }
-
-  if (window.PowerSheet && window.PowerSheet.PowerSheet) {
-    powerSheet = new window.PowerSheet.PowerSheet({
       term: term,
       sendInput: sendWsInput,
-      activeShell: activeShell,
-      onSwitchShell: (newShell) => {
-        handleSwitchShell(newShell);
+      onEsc: () => {
+        if (touchController && typeof touchController.hideCopyPill === 'function') {
+          touchController.hideCopyPill();
+        }
+        if (scrollBall) {
+          scrollBall.syncArrowMode();
+        }
       },
-      onReconnect: () => {
-        reconnectAttempts = 0;
-        isReconnectingReplay = true;
-        connectWebSocket();
+      onCopy: () => {
+        if (term && term.hasSelection()) {
+          const selectedText = term.getSelection();
+          if (window.TouchController && window.TouchController.copyText) {
+            window.TouchController.copyText(selectedText);
+          }
+          return true;
+        }
+        return false;
       },
-      onLogout: () => {
-        doLogout();
-      },
-      onTriggerCopyMode: () => {
-        if (touchController) {
-          if (typeof touchController.triggerCopyMode === 'function') {
-            touchController.triggerCopyMode();
-          } else {
-            const rect = terminalContainerEl.getBoundingClientRect();
-            touchController._triggerCopyMode(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      onPaste: () => {
+        if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+          navigator.clipboard.readText().then(text => {
+            if (text && ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'input', data: text }));
+            }
+          }).catch(err => {
+            console.error('MobileDock paste error, falling back to prompt:', err);
+            if (typeof window !== 'undefined' && typeof window.prompt === 'function') {
+              const pasted = window.prompt('Paste text to terminal:');
+              if (pasted && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'input', data: pasted }));
+              }
+            }
+          });
+        } else if (typeof window !== 'undefined' && typeof window.prompt === 'function') {
+          const pasted = window.prompt('Paste text to terminal:');
+          if (pasted && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'input', data: pasted }));
           }
         }
       }
     });
-    powerSheet.render();
+    mobileDock.mount(document.body);
   }
 }
 
@@ -318,17 +295,11 @@ function connectWebSocket() {
         if (shellSelect) {
           shellSelect.value = "";
         }
-        if (powerSheet) {
-          powerSheet.setActiveShell("");
-        }
         activeShell = "";
       } else if (msg.type === 'shell-active') {
         activeShell = msg.shell;
         if (shellSelect) {
           shellSelect.value = msg.shell;
-        }
-        if (powerSheet) {
-          powerSheet.setActiveShell(msg.shell);
         }
       }
     } catch (err) {
@@ -637,7 +608,6 @@ function handleSwitchShell(selectedShell) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     alert("Unable to switch shell: Connection is closed.");
     if (shellSelect) shellSelect.value = activeShell;
-    if (powerSheet) powerSheet.setActiveShell(activeShell);
     return;
   }
   if (confirm(`Switch to ${selectedShell}? The current session will be terminated.`)) {
@@ -649,7 +619,6 @@ function handleSwitchShell(selectedShell) {
     }));
   } else {
     if (shellSelect) shellSelect.value = activeShell;
-    if (powerSheet) powerSheet.setActiveShell(activeShell);
   }
 }
 

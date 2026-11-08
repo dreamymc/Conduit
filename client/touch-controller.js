@@ -22,7 +22,7 @@
     }
 
     /**
-     * dy: pixel displacement of finger (positive = dragging down, negative = dragging up)
+     * dy: pixel displacement (positive = dragging down, negative = dragging up)
      * returns integer lines to scroll (negative = scroll up, positive = scroll down)
      */
     addDisplacement(dy) {
@@ -49,7 +49,6 @@
     return new Promise((resolve, reject) => {
       const textarea = document.createElement('textarea');
       textarea.value = text;
-      // Use iOS Safari-safe styling: invisible within viewport to avoid scrolling jumps
       textarea.style.position = 'fixed';
       textarea.style.top = '0';
       textarea.style.left = '0';
@@ -96,16 +95,23 @@
   }
 
   /**
-   * TouchController class for kinetic scrolling, alt-screen routing, and copy mode.
+   * TouchController class for terminal touch handling:
+   * 1. Screen dragging scroll on the terminal is DISABLED.
+   * 2. Short tap focuses terminal.
+   * 3. Long-press highlights text / activates copy mode.
+   * 4. Exposes buffer-aware _routeScrollStep for the ScrollBall.
    */
   class TouchController {
     constructor(term, sendInputCallback, options = {}) {
       this.term = term;
       this.sendInput = sendInputCallback;
       this.container = options.container || (term ? term.element : null);
-      // (2) Spec Fix: Time-based friction decay: 0.975 ** (dt / 16.67) so 120Hz phones feel the same
+
+      // Screen dragging scroll on the terminal is DISABLED by default
+      this.screenDragScrollEnabled = options.screenDragScrollEnabled || false;
+      this.onCopyModeChange = options.onCopyModeChange || null;
+
       this.friction = (options.friction !== undefined) ? options.friction : 0.975;
-      // (1) Spec Fix: Apply 1.5x to 2x gain only to fling release velocity
       this.velocityGain = (options.velocityGain !== undefined) ? options.velocityGain : 1.75;
       this.velocityThreshold = 0.01; // px/ms
       this.longPressDelay = 500; // ms
@@ -131,7 +137,6 @@
       this._boundTouchEnd = this._handleTouchEnd.bind(this);
       this._boundTouchCancel = this._handleTouchCancel.bind(this);
       this._boundContextMenu = (e) => {
-        // Prevent browser context menu during touch interactions
         if (this.longPressTriggered || this.isCopyModeActive) {
           e.preventDefault();
         }
@@ -153,8 +158,8 @@
           return { width, height };
         }
       }
-      const screenEl = this.term.element.querySelector('.xterm-screen') || this.term.element;
-      const rect = screenEl.getBoundingClientRect();
+      const screenEl = (this.term.element.querySelector && this.term.element.querySelector('.xterm-screen')) || this.term.element;
+      const rect = screenEl && screenEl.getBoundingClientRect ? screenEl.getBoundingClientRect() : { width: 0, height: 0 };
       const width = (rect.width > 0 && this.term.cols > 0) ? (rect.width / this.term.cols) : 9;
       const height = (rect.height > 0 && this.term.rows > 0) ? (rect.height / this.term.rows) : 18;
       return { width, height };
@@ -164,7 +169,6 @@
       this.container = container;
       if (!this.container) return;
 
-      // Apply touch gesture prevention CSS styles
       this.container.style.touchAction = 'none';
       this.container.style.userSelect = 'none';
       this.container.style.webkitUserSelect = 'none';
@@ -192,7 +196,11 @@
 
     stopMomentum() {
       if (this.animFrameId) {
-        cancelAnimationFrame(this.animFrameId);
+        if (typeof cancelAnimationFrame === 'function') {
+          cancelAnimationFrame(this.animFrameId);
+        } else {
+          clearTimeout(this.animFrameId);
+        }
         this.animFrameId = null;
       }
       this.velocity = 0;
@@ -206,7 +214,6 @@
     }
 
     _handleTouchStart(e) {
-      // If multiple touches, ignore momentum and clear copy timer
       if (e.touches.length > 1) {
         this.clearCopyTimer();
         this.stopMomentum();
@@ -230,12 +237,12 @@
       this.accumulator.reset();
       this.samples = [{ y: touch.clientY, time: this.lastTime }];
 
-      // If user tapped outside copy pill while active, dismiss pill
+      // Dismiss copy pill if tapping outside it
       if (this.isCopyModeActive && (!this.copyPillEl || !this.copyPillEl.contains(e.target))) {
         this.hideCopyPill();
       }
 
-      // Start 500ms long-press Copy Mode timer
+      // 500ms long-press to highlight text / enter copy mode
       this.copyTimer = setTimeout(() => {
         this._triggerCopyMode(touch.clientX, touch.clientY);
       }, this.longPressDelay);
@@ -249,26 +256,22 @@
       const deltaY = touch.clientY - this.touchStartY;
       const dist = Math.hypot(deltaX, deltaY);
 
-      // (4) Spec Fix: Any touchmove beyond 10px cancels the long-press timer and dismisses Copy Mode
       if (dist > 10) {
         this.hasMoved = true;
         this.clearCopyTimer();
         if (this.isCopyModeActive || this.longPressTriggered) {
           this.hideCopyPill();
-          // Reset samples to start from drag onset so stationary hold does not corrupt velocity
           this.samples = [{ y: this.lastY, time: now - 16 }];
         }
       } else if (this.isCopyModeActive || this.longPressTriggered) {
-        // Micro-movements <= 10px while in Copy Mode: ignore jitter and suppress scroll
-        e.preventDefault();
+        if (e.preventDefault) e.preventDefault();
         return;
       }
 
-      e.preventDefault();
+      if (e.preventDefault) e.preventDefault();
 
       const dy = touch.clientY - this.lastY;
 
-      // (3) Spec Fix: Rolling ~150ms sample window with at least 3 samples kept as fallback
       this.samples.push({ y: touch.clientY, time: now });
       while (this.samples.length > 3 && (now - this.samples[0].time) > 150) {
         this.samples.shift();
@@ -278,25 +281,21 @@
       this.lastY = touch.clientY;
       this.lastTime = now;
 
-      // (1) Spec Fix: 1:1 drag tracking (unscaled displacement passed directly to accumulator)
-      const step = this.accumulator.addDisplacement(dy);
-      if (step !== 0) {
-        this._routeScrollStep(step, touch.clientX, touch.clientY);
+      // SCREEN DRAGGING SCROLL IS DISABLED BY DEFAULT:
+      // Only scroll if explicitly enabled
+      if (this.screenDragScrollEnabled) {
+        const step = this.accumulator.addDisplacement(dy);
+        if (step !== 0) {
+          this._routeScrollStep(step, touch.clientX, touch.clientY);
+        }
       }
     }
 
-    /**
-     * (3) Spec Fix: Velocity window ~150ms with a last-3-samples fallback and recency weighting.
-     * (1) Spec Fix: Applies 1.5x - 2x gain only to fling release velocity.
-     */
     calculateReleaseVelocity(now = ((typeof performance !== 'undefined') ? performance.now() : Date.now())) {
       let windowSamples = this.samples.filter(s => (now - s.time) <= 150);
-
-      // Last-3-samples fallback if fewer than 3 samples in window
       if (windowSamples.length < 3 && this.samples.length >= 2) {
         windowSamples = this.samples.slice(-3);
       }
-
       if (windowSamples.length < 2) {
         return 0;
       }
@@ -310,7 +309,6 @@
         const dt = sB.time - sA.time;
         if (dt > 0) {
           const segVel = (sB.y - sA.y) / dt;
-          // Recency weighting: more recent intervals get linearly higher weight (1, 2, 3...)
           const weight = i + 1;
           weightedVelSum += segVel * weight;
           totalWeight += weight;
@@ -329,7 +327,6 @@
         }
       }
 
-      // (1) Apply 1.5x - 2x gain only to fling release velocity
       return baseVelocity * this.velocityGain;
     }
 
@@ -345,7 +342,7 @@
       const deltaY = touch ? (touch.clientY - this.touchStartY) : 0;
       const isShortTap = !this.hasMoved && Math.hypot(deltaX, deltaY) < 10;
 
-      // (1) Spec Fix: touchend short-tap calls term.focus()
+      // Short-tap calls term.focus()
       if (isShortTap) {
         if (this.term && typeof this.term.focus === 'function') {
           this.term.focus();
@@ -353,12 +350,15 @@
         return;
       }
 
-      const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-      const releaseVel = this.calculateReleaseVelocity(now);
-      // Only start momentum if finger was actively moving within ~150ms before release
-      if ((now - this.lastTime) <= 150 && Math.abs(releaseVel) >= this.velocityThreshold) {
-        this.velocity = releaseVel;
-        this._startMomentum();
+      // SCREEN DRAGGING SCROLL DISABLED:
+      // Momentum scrolling is only started if screenDragScrollEnabled is true
+      if (this.screenDragScrollEnabled) {
+        const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+        const releaseVel = this.calculateReleaseVelocity(now);
+        if ((now - this.lastTime) <= 150 && Math.abs(releaseVel) >= this.velocityThreshold) {
+          this.velocity = releaseVel;
+          this._startMomentum();
+        }
       }
     }
 
@@ -371,7 +371,6 @@
     }
 
     getFrictionDecay(dt) {
-      // (2) Spec Fix: Time-based friction: 0.975 ** (dt / 16.67) so 120Hz phones feel the same
       return Math.pow(this.friction, dt / 16.67);
     }
 
@@ -382,7 +381,6 @@
       }
 
       let lastAnimTime = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-
       const raf = (typeof requestAnimationFrame === 'function')
         ? requestAnimationFrame
         : (fn) => setTimeout(() => fn((typeof performance !== 'undefined') ? performance.now() : Date.now()), 16);
@@ -397,8 +395,6 @@
         }
 
         const dy = this.velocity * dt;
-
-        // (2) Time-based friction: 0.975 ** (dt / 16.67)
         this.velocity *= this.getFrictionDecay(dt);
 
         const step = this.accumulator.addDisplacement(dy);
@@ -412,23 +408,17 @@
       this.animFrameId = raf(stepMomentum);
     }
 
-    stopMomentum() {
-      if (this.animFrameId) {
-        if (typeof cancelAnimationFrame === 'function') {
-          cancelAnimationFrame(this.animFrameId);
-        } else {
-          clearTimeout(this.animFrameId);
-        }
-        this.animFrameId = null;
-      }
-      this.velocity = 0;
-    }
-
     /**
      * Routes accumulated scroll steps to the appropriate destination based on buffer type.
      */
-    _routeScrollStep(step, clientX, clientY) {
+    _routeScrollStep(step, clientX = 0, clientY = 0) {
       if (!this.term) return;
+
+      if (clientX === 0 && clientY === 0 && this.container && typeof this.container.getBoundingClientRect === 'function') {
+        const rect = this.container.getBoundingClientRect();
+        clientX = rect.left + rect.width / 2;
+        clientY = rect.top + rect.height / 2;
+      }
 
       const isAlternate = Boolean(
         this.term.buffer &&
@@ -438,7 +428,9 @@
 
       if (!isAlternate) {
         // Normal Buffer: term.scrollLines(step)
-        this.term.scrollLines(step);
+        if (typeof this.term.scrollLines === 'function') {
+          this.term.scrollLines(step);
+        }
       } else {
         // Alternate Buffer
         const mouseTracking = Boolean(
@@ -448,7 +440,6 @@
         );
 
         if (mouseTracking) {
-          // (6) Spec Fix: Wheel in mouse mode: synthetic WheelEvent only.
           const { height } = this.getCellDimensions();
           const wheelDelta = step * height;
           if (this.term.element) {
@@ -471,10 +462,12 @@
                 cancelable: true
               };
             }
-            this.term.element.dispatchEvent(wheelEvt);
+            if (typeof this.term.element.dispatchEvent === 'function') {
+              this.term.element.dispatchEvent(wheelEvt);
+            }
           }
         } else {
-          // (3) Spec Fix: Shared cursor-key helper honoring applicationCursorKeysMode
+          // Alt buffer without mouse tracking: cursor keys
           const direction = step < 0 ? 'up' : 'down';
           const seq = CursorHelper ? CursorHelper.getCursorKeySequence(direction, this.term) : (direction === 'up' ? '\x1b[A' : '\x1b[B');
           const count = Math.abs(step);
@@ -488,7 +481,7 @@
     }
 
     /**
-     * (5) Spec Fix: Copy Mode: define touch-to-cell and word lookup.
+     * Long-press copy / highlight mode: looks up word at touch position and selects it.
      */
     _triggerCopyMode(clientX, clientY) {
       this.longPressTriggered = true;
@@ -498,30 +491,35 @@
       if (typeof navigator !== 'undefined' && navigator.vibrate) {
         try {
           navigator.vibrate(50);
-        } catch (e) {
-          // Vibrate permission or device limitation
-        }
+        } catch (e) {}
       }
 
-      // Calculate cell from touch coordinate
+      if (typeof this.onCopyModeChange === 'function') {
+        this.onCopyModeChange(true);
+      }
+
       const { width, height } = this.getCellDimensions();
-      const screenEl = (this.term && this.term.element) ? (this.term.element.querySelector('.xterm-screen') || this.term.element) : null;
-      const rect = screenEl ? screenEl.getBoundingClientRect() : { left: 0, top: 0, width: 0, height: 0 };
+      const screenEl = (this.term && this.term.element)
+        ? ((this.term.element.querySelector && this.term.element.querySelector('.xterm-screen')) || this.term.element)
+        : null;
+      const rect = (screenEl && screenEl.getBoundingClientRect)
+        ? screenEl.getBoundingClientRect()
+        : { left: 0, top: 0, width: 0, height: 0 };
 
       const col = Math.max(0, Math.min(this.term.cols - 1, Math.floor((clientX - rect.left) / width)));
       const row = Math.max(0, Math.min(this.term.rows - 1, Math.floor((clientY - rect.top) / height)));
 
-      // Word lookup
       const bufferRow = (this.term.buffer && this.term.buffer.active) ? (this.term.buffer.active.viewportY + row) : row;
-      const line = (this.term.buffer && this.term.buffer.active) ? this.term.buffer.active.getLine(bufferRow) : null;
+      const line = (this.term.buffer && this.term.buffer.active && typeof this.term.buffer.active.getLine === 'function')
+        ? this.term.buffer.active.getLine(bufferRow)
+        : null;
 
       let startCol = col;
       let endCol = col + 1;
 
-      if (line) {
+      if (line && typeof line.translateToString === 'function') {
         const lineStr = line.translateToString(true);
         if (col < lineStr.length && lineStr[col].trim() !== '') {
-          // Word character pattern: letters, numbers, underscores, dashes, dots, slashes, colons, at, tildes
           const wordRegex = /[a-zA-Z0-9_\-./:@~]/;
           startCol = col;
           while (startCol > 0 && wordRegex.test(lineStr[startCol - 1])) {
@@ -536,11 +534,9 @@
 
       const wordLength = Math.max(1, endCol - startCol);
       if (this.term && typeof this.term.select === 'function') {
-        // (5) Spec Fix: bufferRow correctly selects in active terminal buffer
         this.term.select(startCol, bufferRow, wordLength);
       }
-
-      this._showCopyPill(clientX, clientY);
+      // Floating pill omitted on mobile; dock reflex keys [ENTER], [ESC], [COPY], [PASTE] control actions
     }
 
     triggerCopyMode(clientX, clientY) {
@@ -555,6 +551,7 @@
     }
 
     _showCopyPill(clientX, clientY) {
+      // Kept for backward compatibility if pill element exists or needed
       if (typeof document === 'undefined') return;
 
       if (!this.copyPillEl) {
@@ -572,8 +569,8 @@
         const cancelBtn = pill.querySelector('.pill-cancel');
 
         const handleCopy = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
+          if (e.preventDefault) e.preventDefault();
+          if (e.stopPropagation) e.stopPropagation();
           const selectedText = this.term ? this.term.getSelection() : '';
           copyText(selectedText)
             .then(() => {
@@ -593,18 +590,15 @@
         };
 
         const handleCancel = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
+          if (e.preventDefault) e.preventDefault();
+          if (e.stopPropagation) e.stopPropagation();
           this.hideCopyPill();
         };
 
         copyBtn.addEventListener('click', handleCopy);
-        copyBtn.addEventListener('touchend', handleCopy);
         cancelBtn.addEventListener('click', handleCancel);
-        cancelBtn.addEventListener('touchend', handleCancel);
       }
 
-      // Position pill above or near the tap coordinate
       const pill = this.copyPillEl;
       pill.style.display = 'flex';
       pill.style.visibility = 'hidden';
@@ -614,11 +608,10 @@
       let left = clientX - (pillWidth / 2);
       let top = clientY - pillHeight - 14;
 
-      // Clamp within viewport
-      const maxLeft = (window.innerWidth || 360) - pillWidth - 10;
+      const maxLeft = (typeof window !== 'undefined' ? window.innerWidth : 360) - pillWidth - 10;
       left = Math.max(10, Math.min(maxLeft, left));
       if (top < 10) {
-        top = clientY + 24; // If near top, place pill below finger
+        top = clientY + 24;
       }
 
       pill.style.left = `${left}px`;
@@ -633,8 +626,13 @@
       if (this.term && typeof this.term.clearSelection === 'function') {
         this.term.clearSelection();
       }
+      const wasActive = this.isCopyModeActive;
       this.isCopyModeActive = false;
       this.longPressTriggered = false;
+      this.hasMoved = false;
+      if (wasActive && typeof this.onCopyModeChange === 'function') {
+        this.onCopyModeChange(false);
+      }
     }
   }
 

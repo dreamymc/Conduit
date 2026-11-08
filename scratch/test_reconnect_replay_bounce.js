@@ -38,7 +38,7 @@ function startServer() {
 function verifyMobileStaticAssets() {
   return new Promise((resolve, reject) => {
     console.log("Verifying mobile script static assets are served...");
-    const files = ['/cursor-helper.js', '/touch-controller.js', '/mobile-dock.js', '/power-sheet.js'];
+    const files = ['/cursor-helper.js', '/touch-controller.js', '/mobile-dock.js', '/scroll-ball.js'];
     let remaining = files.length;
 
     files.forEach(file => {
