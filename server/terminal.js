@@ -1,6 +1,7 @@
 const pty = require('node-pty');
 const fs = require('fs');
 const os = require('os');
+const { execSync } = require('child_process');
 const config = require('./config');
 const { revokedTokens } = require('./auth');
 
@@ -8,7 +9,8 @@ const { revokedTokens } = require('./auth');
 const WSL_MOUNT = fs.existsSync('/mnt/c') ? '/mnt/c' : (fs.existsSync('/c') ? '/c' : null);
 
 const activeSessions = new Map();
-const MAX_BUFFER_LENGTH = 50 * 1024; // 50KB
+const MAX_BUFFER_LENGTH = 512 * 1024; // 512KB scrollback buffer
+const MAX_SESSIONS = 10; // Maximum concurrent sessions
 
 const parseDim = (val, defaultValue) => {
   const parsed = parseInt(val, 10);
@@ -57,6 +59,66 @@ function resolveShellPath(shell) {
     default:
       return '/bin/bash';
   }
+}
+
+/**
+ * Checks if a process name corresponds to an idle shell executable.
+ */
+function isShellProcess(procName, shellName = '') {
+  if (!procName) return false;
+  const lower = procName.toLowerCase();
+  const lowerShell = (shellName || '').toLowerCase();
+  return lower.endsWith('bash') ||
+         lower.endsWith('zsh') ||
+         lower.endsWith('sh') ||
+         lower.endsWith('cmd.exe') ||
+         lower.endsWith('powershell.exe') ||
+         (lowerShell && lower.endsWith(lowerShell));
+}
+
+/**
+ * (7) Spec Fix: Detects whether a session has a running foreground process.
+ * Returns the process name or descriptor if running, or null if idle shell.
+ */
+function getRunningForegroundProcess(session) {
+  if (!session || !session.term) return null;
+
+  // 1. Check term.process from node-pty
+  const proc = session.term.process;
+  if (proc && !isShellProcess(proc, session.shell)) {
+    return proc;
+  }
+
+  // 2. Check child processes of the shell PID
+  if (session.term.pid) {
+    try {
+      const out = execSync(`pgrep -P ${session.term.pid}`, {
+        timeout: 200,
+        stdio: ['ignore', 'pipe', 'ignore']
+      }).toString().trim();
+
+      if (out.length > 0) {
+        const childPids = out.split('\n').map(s => s.trim()).filter(Boolean);
+        for (const pid of childPids) {
+          try {
+            const cmd = execSync(`ps -p ${pid} -o comm=`, {
+              timeout: 200,
+              stdio: ['ignore', 'pipe', 'ignore']
+            }).toString().trim();
+            if (cmd && !isShellProcess(cmd, session.shell)) {
+              return cmd;
+            }
+          } catch (e) {
+            // Process may have exited
+          }
+        }
+      }
+    } catch (e) {
+      // pgrep exit code 1 indicates no children found
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -149,7 +211,9 @@ function spawnSession(sessionId, session, shellName) {
     }
 
     session.activeDataListener = session.term.onData((data) => {
-      // Append to the scrollback buffer
+      session.lastActiveTime = Date.now();
+
+      // Append to the 512KB scrollback buffer
       session.buffer += data;
       if (session.buffer.length > MAX_BUFFER_LENGTH) {
         session.buffer = session.buffer.slice(session.buffer.length - MAX_BUFFER_LENGTH);
@@ -192,6 +256,7 @@ function spawnSession(sessionId, session, shellName) {
 function bindSocketToSession(ws, sessionId, session) {
   const messageHandler = (message) => {
     try {
+      session.lastActiveTime = Date.now();
       const msg = JSON.parse(message);
       if (msg.type === 'input') {
         if (session.term) {
@@ -247,7 +312,6 @@ function bindSocketToSession(ws, sessionId, session) {
   };
 
   const closeHandler = (code, reason) => {
-    // Only handle if this socket is still the active socket for the session
     if (session.ws !== ws) {
       return;
     }
@@ -278,6 +342,7 @@ function spawnTerminal(ws, sessionId, initialShell = 'bash', jti = null) {
   if (activeSessions.has(sessionId)) {
     const session = activeSessions.get(sessionId);
     session.jti = jti;
+    session.lastActiveTime = Date.now();
 
     // Clear the disconnect timeout if running
     if (session.disconnectTimeout) {
@@ -298,7 +363,7 @@ function spawnTerminal(ws, sessionId, initialShell = 'bash', jti = null) {
       }
     }
 
-    // Send the rolling scrollback history buffer
+    // Send the rolling 512KB scrollback history buffer
     if (session.buffer && ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({ type: 'output', data: session.buffer }));
     }
@@ -311,6 +376,60 @@ function spawnTerminal(ws, sessionId, initialShell = 'bash', jti = null) {
     // Bind WebSocket message handlers and close handler to this session
     bindSocketToSession(ws, sessionId, session);
   } else {
+    // Check session capacity
+    if (activeSessions.size >= MAX_SESSIONS) {
+      // Find candidate disconnected sessions
+      const disconnectedSessions = [];
+      for (const [id, sess] of activeSessions.entries()) {
+        if (!sess.ws || sess.disconnectTimeout !== null) {
+          disconnectedSessions.push({ id, session: sess });
+        }
+      }
+
+      if (disconnectedSessions.length === 0) {
+        // All sessions are actively connected -> reject connection
+        console.warn(`[Session Cap] Rejecting connection: maximum session capacity of ${MAX_SESSIONS} reached with all sessions active.`);
+        if (ws.readyState === ws.OPEN || ws.readyState === 0) {
+          try {
+            ws.close(4002, 'Server session capacity full');
+          } catch (e) {
+            console.error('Error closing WebSocket when capacity full:', e);
+          }
+        }
+        return;
+      }
+
+      // Sort disconnected sessions by lastActiveTime ascending (oldest first)
+      disconnectedSessions.sort((a, b) => (a.session.lastActiveTime || 0) - (b.session.lastActiveTime || 0));
+
+      // (7) Spec Fix: LRU eviction skips sessions with a running foreground process, or logs the kill
+      let candidate = null;
+      let killedFgProc = null;
+
+      // First pass: find a disconnected session without running foreground processes
+      for (const item of disconnectedSessions) {
+        const fgProc = getRunningForegroundProcess(item.session);
+        if (!fgProc) {
+          candidate = item;
+          break;
+        }
+      }
+
+      // Second pass: if all have running foreground processes, evict the oldest disconnected one
+      if (!candidate) {
+        candidate = disconnectedSessions[0];
+        killedFgProc = getRunningForegroundProcess(candidate.session);
+      }
+
+      if (killedFgProc) {
+        console.warn(`[LRU Eviction] Evicting session "${candidate.id}" with running foreground process (${killedFgProc})`);
+      } else {
+        console.log(`[LRU Eviction] Evicting idle disconnected session "${candidate.id}"`);
+      }
+
+      cleanupSession(candidate.id);
+    }
+
     // Create a new session object
     const session = {
       term: null,
@@ -322,7 +441,8 @@ function spawnTerminal(ws, sessionId, initialShell = 'bash', jti = null) {
       activeDataListener: null,
       activeExitListener: null,
       disconnectTimeout: null,
-      jti: jti
+      jti: jti,
+      lastActiveTime: Date.now()
     };
     activeSessions.set(sessionId, session);
 
@@ -335,5 +455,10 @@ function spawnTerminal(ws, sessionId, initialShell = 'bash', jti = null) {
 }
 
 module.exports = {
-  spawnTerminal
+  spawnTerminal,
+  cleanupSession,
+  activeSessions,
+  getRunningForegroundProcess,
+  MAX_SESSIONS,
+  MAX_BUFFER_LENGTH
 };

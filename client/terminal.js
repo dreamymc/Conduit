@@ -2,6 +2,17 @@ let ctrlActive = false;
 let activeShell = 'bash';
 const shellSelect = document.getElementById('shell-select');
 
+// Mobile gating: URL parameter, coarse pointer, or viewport <= 600px
+const isMobile = (
+  window.location.search.includes('mobile=1') ||
+  Boolean(window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ||
+  window.innerWidth <= 600
+);
+
+if (isMobile) {
+  document.body.classList.add('is-mobile');
+}
+
 // Retrieve token from local storage
 const token = localStorage.getItem('conduit_token');
 if (!token) {
@@ -19,6 +30,7 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const BACKOFF_DELAYS = [2000, 4000, 8000, 16000, 30000];
 let reconnectTimer = null;
+let isReconnectingReplay = false;
 
 // DOM element references for reconnection
 const reconnectOverlay = document.getElementById('reconnect-overlay');
@@ -26,9 +38,10 @@ const reconnectStatus = document.getElementById('reconnect-status');
 const reconnectBtn = document.getElementById('reconnect-btn');
 const spinner = reconnectOverlay ? reconnectOverlay.querySelector('.spinner') : null;
 
-// Initialize xterm.js terminal
+// Initialize xterm.js terminal with 10,000 lines scrollback
 const term = new Terminal({
   cursorBlink: true,
+  scrollback: 10000,
   theme: {
     background: '#0d0d0d',
     foreground: '#f8f8f2',
@@ -45,15 +58,28 @@ term.loadAddon(fitAddon);
 term.loadAddon(webLinksAddon);
 term.open(document.getElementById('terminal-container'));
 
+function sendWsInput(data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'input', data }));
+  }
+}
+
 // Resize terminal and send to server
 function resizeTerminal() {
   try {
-    const topBar = document.getElementById('top-bar');
-    const toolbar = document.getElementById('toolbar');
-    const topBarHeight = topBar ? topBar.offsetHeight : 40;
-    const toolbarHeight = toolbar ? toolbar.offsetHeight : 52;
     const viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
-    const targetHeight = viewportHeight - topBarHeight - toolbarHeight;
+    let targetHeight;
+
+    if (isMobile) {
+      // 44px mobile dock
+      targetHeight = viewportHeight - 44;
+    } else {
+      const topBar = document.getElementById('top-bar');
+      const toolbar = document.getElementById('toolbar');
+      const topBarHeight = topBar ? topBar.offsetHeight : 40;
+      const toolbarHeight = toolbar ? toolbar.offsetHeight : 52;
+      targetHeight = viewportHeight - topBarHeight - toolbarHeight;
+    }
 
     const container = document.getElementById('terminal-container');
     if (container) {
@@ -92,6 +118,66 @@ function resizeTerminal() {
 // Run initial resize before websocket setup
 resizeTerminal();
 
+// Initialize mobile subsystem components if mobile gating is active
+let mobileDock = null;
+let powerSheet = null;
+let touchController = null;
+
+if (isMobile) {
+  const terminalContainerEl = document.getElementById('terminal-container');
+
+  if (window.TouchController && window.TouchController.TouchController) {
+    touchController = new window.TouchController.TouchController(term, sendWsInput, {
+      container: terminalContainerEl
+    });
+  }
+
+  if (window.MobileDock && window.MobileDock.MobileDock) {
+    mobileDock = new window.MobileDock.MobileDock({
+      sendInput: sendWsInput,
+      onTogglePowerSheet: (forceOpen) => {
+        if (!powerSheet) return;
+        if (forceOpen === true) {
+          powerSheet.open();
+        } else {
+          powerSheet.toggle();
+        }
+      }
+    });
+    mobileDock.mount(document.body);
+  }
+
+  if (window.PowerSheet && window.PowerSheet.PowerSheet) {
+    powerSheet = new window.PowerSheet.PowerSheet({
+      term: term,
+      sendInput: sendWsInput,
+      activeShell: activeShell,
+      onSwitchShell: (newShell) => {
+        handleSwitchShell(newShell);
+      },
+      onReconnect: () => {
+        reconnectAttempts = 0;
+        isReconnectingReplay = true;
+        connectWebSocket();
+      },
+      onLogout: () => {
+        doLogout();
+      },
+      onTriggerCopyMode: () => {
+        if (touchController) {
+          if (typeof touchController.triggerCopyMode === 'function') {
+            touchController.triggerCopyMode();
+          } else {
+            const rect = terminalContainerEl.getBoundingClientRect();
+            touchController._triggerCopyMode(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          }
+        }
+      }
+    });
+    powerSheet.render();
+  }
+}
+
 // Setup WebSocket connection with reconnection logic
 function connectWebSocket() {
   if (reconnectTimer) {
@@ -111,6 +197,9 @@ function connectWebSocket() {
     if (reconnectOverlay) {
       reconnectOverlay.classList.add('hidden');
     }
+    if (mobileDock) {
+      mobileDock.setConnectionStatus('connected');
+    }
     resizeTerminal();
   };
 
@@ -118,18 +207,63 @@ function connectWebSocket() {
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'output') {
-        term.write(msg.data);
+        if (isReconnectingReplay) {
+          isReconnectingReplay = false;
+          // Calculate relative bottom-offset scroll restoration
+          const wasAtBottom = (term.buffer.active.viewportY === term.buffer.active.baseY);
+          const bottomOffset = Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY);
+
+          // (2) Spec Fix: Clear corrupted escape state
+          term.reset();
+
+          term.write(msg.data, () => {
+            if (wasAtBottom) {
+              term.scrollToBottom();
+            } else {
+              const targetY = Math.max(0, term.buffer.active.baseY - bottomOffset);
+              term.scrollToLine(targetY);
+            }
+
+            // (2) Spec Fix: Force a TUI redraw via PTY resize bounce
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              const currentCols = term.cols;
+              const currentRows = term.rows;
+              ws.send(JSON.stringify({
+                type: 'resize',
+                cols: currentCols,
+                rows: Math.max(1, currentRows - 1)
+              }));
+              setTimeout(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: 'resize',
+                    cols: currentCols,
+                    rows: currentRows
+                  }));
+                }
+              }, 50);
+            }
+          });
+        } else {
+          term.write(msg.data);
+        }
       } else if (msg.type === 'exit') {
         term.write(`\r\n\x1b[33m[Shell exited — ${msg.shell || activeShell} returned code ${msg.code}]\x1b[0m\r\n`);
         term.write(`\x1b[32m[Use the dropdown at the top to spawn another shell or reconnect]\x1b[0m\r\n`);
         if (shellSelect) {
           shellSelect.value = "";
         }
+        if (powerSheet) {
+          powerSheet.setActiveShell("");
+        }
         activeShell = "";
       } else if (msg.type === 'shell-active') {
         activeShell = msg.shell;
         if (shellSelect) {
           shellSelect.value = msg.shell;
+        }
+        if (powerSheet) {
+          powerSheet.setActiveShell(msg.shell);
         }
       }
     } catch (err) {
@@ -141,18 +275,49 @@ function connectWebSocket() {
     if (event.code === 4001) {
       term.write('\r\n[Authentication failed or expired. Redirecting to login...]\r\n');
       localStorage.removeItem('conduit_token');
+      if (mobileDock) {
+        mobileDock.setConnectionStatus('disconnected');
+      }
       setTimeout(() => {
         window.location.href = '/';
       }, 2000);
+    } else if (event.code === 4002) {
+      // Session cap rejection (HTTP 429 / code 4002): halt retry loop
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      term.write('\r\n[Server session capacity full: Session limit reached. Close another tab.]\r\n');
+      if (reconnectStatus) {
+        reconnectStatus.textContent = "Session limit reached. Close another tab.";
+      }
+      if (reconnectOverlay) {
+        reconnectOverlay.classList.remove('hidden');
+      }
+      if (spinner) {
+        spinner.classList.add('hidden');
+      }
+      if (reconnectBtn) {
+        reconnectBtn.classList.remove('hidden');
+      }
+      if (mobileDock) {
+        mobileDock.setConnectionStatus('disconnected');
+      }
     } else if (event.reason === 'logout') {
       term.write('\r\n[Logged out]\r\n');
       localStorage.removeItem('conduit_token');
+      if (mobileDock) {
+        mobileDock.setConnectionStatus('disconnected');
+      }
       setTimeout(() => {
         window.location.href = '/';
       }, 1500);
     } else {
       if (reconnectAttempts === 0) {
         term.write('\r\n[Connection lost]\r\n');
+      }
+      if (mobileDock) {
+        mobileDock.setConnectionStatus('reconnecting');
       }
       handleReconnect();
     }
@@ -177,11 +342,15 @@ function handleReconnect() {
     if (spinner) {
       spinner.classList.add('hidden');
     }
+    if (mobileDock) {
+      mobileDock.setConnectionStatus('disconnected');
+    }
     return;
   }
 
   const delay = BACKOFF_DELAYS[reconnectAttempts];
   reconnectAttempts++;
+  isReconnectingReplay = true;
 
   if (reconnectOverlay) {
     reconnectOverlay.classList.remove('hidden');
@@ -206,6 +375,7 @@ if (reconnectBtn) {
   reconnectBtn.addEventListener('click', (e) => {
     e.preventDefault();
     reconnectAttempts = 0;
+    isReconnectingReplay = true;
     if (reconnectStatus) {
       reconnectStatus.textContent = "Reconnecting...";
     }
@@ -219,30 +389,57 @@ if (reconnectBtn) {
   });
 }
 
-// Start the initial connection on startup
-connectWebSocket();
-
-// Handle user typing
-term.onData((data) => {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-  if (ctrlActive) {
-    // Check if the input is a single alphabetical character
-    const char = data.toUpperCase();
-    if (char.length === 1 && char.charCodeAt(0) >= 65 && char.charCodeAt(0) <= 90) {
-      const ctrlCode = String.fromCharCode(char.charCodeAt(0) - 64);
-      ws.send(JSON.stringify({ type: 'input', data: ctrlCode }));
-    } else {
-      // Send unmodified sequence
-      ws.send(JSON.stringify({ type: 'input', data }));
+// Lifecycle listeners for mobile browsers
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      console.log("App visibility restored. Reconnecting WebSocket...");
+      reconnectAttempts = 0;
+      isReconnectingReplay = true;
+      connectWebSocket();
     }
-    toggleCtrl(false);
-  } else {
-    ws.send(JSON.stringify({ type: 'input', data }));
   }
 });
 
-// Setup Mobile Toolbar CTRL Toggle
+window.addEventListener('online', () => {
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    console.log("Network online. Checking WebSocket connection...");
+    reconnectAttempts = 0;
+    isReconnectingReplay = true;
+    connectWebSocket();
+  }
+});
+
+// Start the initial connection on startup
+connectWebSocket();
+
+// Handle user typing:
+// (4) Spec Fix: Sticky CTRL hooks onData, converts only single-char data, else clears and passes through.
+term.onData((data) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  if (isMobile && mobileDock) {
+    mobileDock.handleData(data, (converted) => {
+      ws.send(JSON.stringify({ type: 'input', data: converted }));
+    });
+  } else {
+    // Desktop keyboard handling
+    if (ctrlActive) {
+      const char = data.toUpperCase();
+      if (char.length === 1 && char.charCodeAt(0) >= 65 && char.charCodeAt(0) <= 90) {
+        const ctrlCode = String.fromCharCode(char.charCodeAt(0) - 64);
+        ws.send(JSON.stringify({ type: 'input', data: ctrlCode }));
+      } else {
+        ws.send(JSON.stringify({ type: 'input', data }));
+      }
+      toggleCtrl(false);
+    } else {
+      ws.send(JSON.stringify({ type: 'input', data }));
+    }
+  }
+});
+
+// Setup Desktop Mobile Toolbar CTRL Toggle
 const ctrlBtn = document.getElementById('ctrl-btn');
 function toggleCtrl(state) {
   ctrlActive = state !== undefined ? state : !ctrlActive;
@@ -264,7 +461,7 @@ if (ctrlBtn) {
   ctrlBtn.addEventListener('touchstart', handleCtrl);
 }
 
-// Special sequences mapping for touch buttons
+// Special sequences mapping for touch buttons on desktop toolbar
 const seqMap = {
   'esc': '\x1b',
   'tab': '\t',
@@ -309,74 +506,78 @@ if (window.visualViewport) {
 // Initial fit
 setTimeout(resizeTerminal, 100);
 
-// Handle Logout Action
-const logoutBtn = document.getElementById('logout-btn');
-if (logoutBtn) {
-  const handleLogout = (e) => {
-    e.preventDefault();
-    if (confirm("Disconnect and log out of Conduit?")) {
-      localStorage.removeItem('conduit_token');
-      if (ws) {
-        ws.close(1000, 'logout');
-      }
-      window.location.href = '/';
+function doLogout() {
+  if (confirm("Disconnect and log out of Conduit?")) {
+    localStorage.removeItem('conduit_token');
+    if (ws) {
+      ws.close(1000, 'logout');
     }
-  };
-  logoutBtn.addEventListener('click', handleLogout);
-  logoutBtn.addEventListener('touchstart', handleLogout);
+    window.location.href = '/';
+  }
 }
 
-// Handle Shell Switcher Selection
-if (shellSelect) {
-  shellSelect.value = activeShell;
-
-  shellSelect.addEventListener('change', () => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      alert("Unable to switch shell: Connection is closed.");
-      shellSelect.value = activeShell;
-      return;
-    }
-    const selectedShell = shellSelect.value;
-    const displayName = shellSelect.options[shellSelect.selectedIndex].text;
-    if (confirm(`Switch to ${displayName}? The current session will be terminated.`)) {
-      ws.send(JSON.stringify({
-        type: 'shell',
-        shell: selectedShell,
-        cols: term.cols,
-        rows: term.rows
-      }));
-    } else {
-      shellSelect.value = activeShell;
-    }
+// Handle Logout Action from desktop bar
+const logoutBtn = document.getElementById('logout-btn');
+if (logoutBtn) {
+  logoutBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    doLogout();
+  });
+  logoutBtn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    doLogout();
   });
 }
 
-// --- Custom Context Menu & Copy/Paste Logic ---
+function handleSwitchShell(selectedShell) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    alert("Unable to switch shell: Connection is closed.");
+    if (shellSelect) shellSelect.value = activeShell;
+    if (powerSheet) powerSheet.setActiveShell(activeShell);
+    return;
+  }
+  if (confirm(`Switch to ${selectedShell}? The current session will be terminated.`)) {
+    ws.send(JSON.stringify({
+      type: 'shell',
+      shell: selectedShell,
+      cols: term.cols,
+      rows: term.rows
+    }));
+  } else {
+    if (shellSelect) shellSelect.value = activeShell;
+    if (powerSheet) powerSheet.setActiveShell(activeShell);
+  }
+}
+
+// Handle Shell Switcher Selection from desktop bar
+if (shellSelect) {
+  shellSelect.value = activeShell;
+  shellSelect.addEventListener('change', () => {
+    handleSwitchShell(shellSelect.value);
+  });
+}
+
+// --- Custom Context Menu & Copy/Paste Logic for Desktop ---
 const contextMenu = document.getElementById('context-menu');
 const ctxCopy = document.getElementById('ctx-copy');
 const ctxPaste = document.getElementById('ctx-paste');
 const terminalContainer = document.getElementById('terminal-container');
 
-// Helper to check if clipboard permissions/APIs are available
 const hasClipboardSupport = typeof navigator.clipboard !== 'undefined';
 const isSecureContext = window.isSecureContext || window.location.protocol === 'https:' || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
 
 function showContextMenu(x, y) {
-  if (!contextMenu) return;
+  if (!contextMenu || isMobile) return;
 
-  // Enable/disable copy button based on selection
   if (ctxCopy) {
     const hasSelection = term.hasSelection();
     ctxCopy.disabled = !hasSelection;
   }
 
-  // Enable/disable paste button based on secure context check
   if (ctxPaste) {
-    // navigator.clipboard.readText is only accessible in secure contexts (HTTPS or localhost)
     ctxPaste.disabled = !isSecureContext || !hasClipboardSupport;
   }
 
-  // Position the menu
   contextMenu.style.left = `${x}px`;
   contextMenu.style.top = `${y}px`;
   contextMenu.classList.remove('hidden');
@@ -388,87 +589,57 @@ function hideContextMenu() {
   }
 }
 
-// Right-click or long-press context menu intercept
 if (terminalContainer) {
   terminalContainer.addEventListener('contextmenu', (e) => {
+    if (isMobile) {
+      e.preventDefault();
+      return;
+    }
     e.preventDefault();
-    
-    // Calculate viewport bounds to prevent menu overflow
     let x = e.clientX;
     let y = e.clientY;
-    
-    // Fallback coordinates for touch events if clientX is undefined
-    if (x === undefined && e.touches && e.touches[0]) {
-      x = e.touches[0].clientX;
-      y = e.touches[0].clientY;
-    }
-    
-    const menuWidth = 160;
-    const menuHeight = 100;
-    const windowWidth = window.innerWidth;
-    const windowHeight = window.innerHeight;
-    
-    if (x + menuWidth > windowWidth) {
-      x = windowWidth - menuWidth - 10;
-    }
-    if (y + menuHeight > windowHeight) {
-      y = windowHeight - menuHeight - 10;
-    }
-    
     showContextMenu(x, y);
   });
 }
 
-// Dismiss context menu on click anywhere else
 document.addEventListener('click', (e) => {
   if (contextMenu && !contextMenu.contains(e.target)) {
     hideContextMenu();
   }
 });
 
-// Copy action handler
 if (ctxCopy) {
   ctxCopy.addEventListener('click', (e) => {
     e.preventDefault();
     e.stopPropagation();
-    
     if (term.hasSelection()) {
       const selectedText = term.getSelection();
-      if (hasClipboardSupport) {
-        navigator.clipboard.writeText(selectedText)
-          .then(() => {
-            const originalText = ctxCopy.textContent;
-            ctxCopy.textContent = "Copied!";
-            setTimeout(() => {
-              ctxCopy.textContent = originalText;
-              hideContextMenu();
-            }, 800);
-          })
-          .catch((err) => {
-            console.error("Clipboard write failed: ", err);
-            alert("Clipboard copy failed. Please copy manually.");
+      if (window.TouchController && window.TouchController.copyText) {
+        window.TouchController.copyText(selectedText).then(() => {
+          const originalText = ctxCopy.textContent;
+          ctxCopy.textContent = "Copied!";
+          setTimeout(() => {
+            ctxCopy.textContent = originalText;
             hideContextMenu();
-          });
-      } else {
-        alert("Clipboard access not supported in this browser.");
-        hideContextMenu();
+          }, 800);
+        }).catch(() => {
+          alert("Clipboard copy failed.");
+          hideContextMenu();
+        });
       }
     }
   });
 }
 
-// Paste action handler
 if (ctxPaste) {
   ctxPaste.addEventListener('click', (e) => {
     e.preventDefault();
     e.stopPropagation();
-    
     if (!isSecureContext || !hasClipboardSupport) {
-      alert("Paste is disabled: navigator.clipboard requires a Secure Context (HTTPS or localhost). Please use the Cloudflare Tunnel URL to paste.");
+      alert("Paste is disabled: navigator.clipboard requires a Secure Context.");
       hideContextMenu();
       return;
     }
-    
     navigator.clipboard.readText()
       .then((text) => {
         if (text && ws && ws.readyState === WebSocket.OPEN) {
@@ -478,7 +649,7 @@ if (ctxPaste) {
       })
       .catch((err) => {
         console.error("Clipboard read failed: ", err);
-        alert("Could not read clipboard. Please check browser permissions.");
+        alert("Could not read clipboard.");
         hideContextMenu();
       });
   });
