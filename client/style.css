@@ -580,6 +580,56 @@ body.is-mobile #terminal-container {
   color: #fff;
 }
 
+/* Floating Jump-to-Bottom Pill (Mobile: normal buffer only, above dock) */
+.jump-to-bottom-pill {
+  position: fixed;
+  bottom: calc(52px + env(safe-area-inset-bottom, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 150;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background-color: #1c1c1c;
+  color: #ff9900;
+  border: 1px solid #ff9900;
+  border-radius: 20px;
+  padding: 6px 14px;
+  font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.7);
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition: opacity 0.2s ease, transform 0.2s ease, visibility 0.2s ease;
+}
+
+.jump-to-bottom-pill.hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(8px);
+}
+
+.jump-to-bottom-pill:active {
+  background-color: #282828;
+  border-color: #ffb366;
+  transform: translateX(-50%) scale(0.96);
+}
+
+.jump-to-bottom-pill .jump-icon {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.jump-to-bottom-pill .jump-label {
+  line-height: 1;
+  letter-spacing: 0.2px;
+}
+
 /* Power Sheet Drawer & Scrim */
 .sheet-scrim {
   position: fixed;

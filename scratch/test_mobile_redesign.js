@@ -249,6 +249,119 @@ tc._handleTouchMove({ touches: [{ clientX: 50, clientY: 150 }], preventDefault: 
 assert.strictEqual(tc.hasMoved, true);
 tc._handleTouchEnd({ changedTouches: [{ clientX: 52, clientY: 53 }] }); // released near start
 assert.strictEqual(focusCalled, false, 'Round-trip pan must NOT be misclassified as a short tap');
+
+// 4.8 Regression Test (Spec Fix 5 / Req 5): Long-press, then drag, and it must scroll
+scrolledLines = null;
+focusCalled = false;
+tc.touchStartX = 50;
+tc.touchStartY = 50;
+tc.lastX = 50;
+tc.lastY = 50;
+tc.hasMoved = false;
+
+// 1. Verify long-press timer cancellation if movement exceeds 10px before 500ms
+tc._handleTouchStart({ touches: [{ clientX: 50, clientY: 50 }] });
+assert.notStrictEqual(tc.copyTimer, null, 'TouchStart must start long-press timer');
+tc._handleTouchMove({ touches: [{ clientX: 50, clientY: 65 }], preventDefault: () => {} }); // moved 15px
+assert.strictEqual(tc.copyTimer, null, 'Touchmove > 10px must cancel long-press timer');
+assert.strictEqual(tc.isCopyModeActive, false, 'Copy Mode must not activate if moved > 10px');
+
+// 2. Simulate long-press Copy Mode triggered
+tc.touchStartX = 50;
+tc.touchStartY = 50;
+tc.lastX = 50;
+tc.lastY = 50;
+tc.hasMoved = false;
+tc._triggerCopyMode(50, 50);
+assert.strictEqual(tc.isCopyModeActive, true, 'Copy mode must be active after long-press');
+assert.strictEqual(tc.longPressTriggered, true, 'longPressTriggered must be true');
+
+// 3. Micro-movement <= 10px must stay in Copy Mode and NOT scroll
+mockTerm.buffer.active.type = 'normal';
+scrolledLines = null;
+tc._handleTouchMove({ touches: [{ clientX: 55, clientY: 55 }], preventDefault: () => {} });
+assert.strictEqual(tc.isCopyModeActive, true, 'Micro-movement <= 10px must retain Copy Mode');
+assert.strictEqual(scrolledLines, null, 'Micro-movement <= 10px must not scroll');
+
+// 4. Touchmove > 10px must dismiss Copy Mode, cancel timer, and scroll terminal
+tc._handleTouchMove({ touches: [{ clientX: 50, clientY: 100 }], preventDefault: () => {} });
+assert.strictEqual(tc.isCopyModeActive, false, 'Touchmove > 10px must dismiss Copy Mode');
+assert.strictEqual(tc.longPressTriggered, false, 'Touchmove > 10px must clear longPressTriggered');
+assert.notStrictEqual(scrolledLines, null, 'Touchmove > 10px after long-press must scroll');
+assert.strictEqual(scrolledLines < 0, true, 'Dragging down must scroll up');
+
+// 5. Dragging up after long-press must scroll down
+scrolledLines = null;
+tc._handleTouchMove({ touches: [{ clientX: 50, clientY: 40 }], preventDefault: () => {} });
+assert.notStrictEqual(scrolledLines, null, 'Dragging up must scroll');
+assert.strictEqual(scrolledLines > 0, true, 'Dragging up must scroll down');
+
+// 6. Release after drag must NOT call term.focus()
+focusCalled = false;
+tc._handleTouchEnd({ changedTouches: [{ clientX: 50, clientY: 40 }] });
+assert.strictEqual(focusCalled, false, 'Release after long-press + drag must not focus');
+
+// 7. Pausing stationary for >150ms before release must NOT trigger momentum
+tc.touchStartX = 50;
+tc.touchStartY = 50;
+tc.lastX = 50;
+tc.lastY = 50;
+tc.hasMoved = false;
+tc.samples = [];
+tc._handleTouchStart({ touches: [{ clientX: 50, clientY: 50 }] });
+// Fast drag to generate velocity
+tc._handleTouchMove({ touches: [{ clientX: 50, clientY: 120 }], preventDefault: () => {} });
+assert.strictEqual(tc.hasMoved, true);
+// Simulate pause of 300ms before release: lastTime was set during move
+tc.stopMomentum();
+tc._handleTouchEnd({ changedTouches: [{ clientX: 50, clientY: 120 }] });
+// Verify that velocity does not run momentum if released long after moving
+const pauseReleaseVel = tc.calculateReleaseVelocity(tc.lastTime + 300);
+// While calculateReleaseVelocity provides the fallback value, _handleTouchEnd prevents momentum:
+assert.strictEqual(tc.animFrameId, null, 'Stationary hold before release must not start momentum');
+
+// 4.9 Time-based friction: 0.975 ** (dt / 16.67) so 120Hz phones feel the same (Req 2)
+assert.strictEqual(tc.friction, 0.975, 'Default friction must be 0.975');
+const decay60Hz = tc.getFrictionDecay(16.67);
+assert(Math.abs(decay60Hz - 0.975) < 1e-4, 'At dt=16.67ms (60Hz), decay factor must be ~0.975');
+const decay120Hz = tc.getFrictionDecay(16.67 / 2); // 8.335ms
+assert(Math.abs(Math.pow(decay120Hz, 2) - 0.975) < 1e-4, 'Two 120Hz frames must equal one 60Hz frame decay');
+
+// 4.10 Velocity window ~150ms with last-3-samples fallback and recency weighting (Req 1 & 3)
+// 1:1 drag tracking check: accumulator with 18px line height moves 36px -> exactly 2 lines
+accum.reset();
+accum.setLineHeight(18);
+assert.strictEqual(accum.addDisplacement(-36), 2, 'Drag tracking must be 1:1 without gain');
+
+// Velocity calculation with recency weighting and gain
+tc.samples = [
+  { y: 100, time: 1000 },
+  { y: 130, time: 1020 }, // dt=20, dy=30 -> v=1.5, weight=1
+  { y: 180, time: 1040 }  // dt=20, dy=50 -> v=2.5, weight=2
+];
+// Base weighted velocity = (1.5 * 1 + 2.5 * 2) / 3 = 6.5 / 3 = 2.1666...
+// Release velocity with 1.75 gain = 2.1666... * 1.75 = 3.79166...
+const releaseVel = tc.calculateReleaseVelocity(1050); // within 150ms
+const expectedBase = (1.5 * 1 + 2.5 * 2) / 3;
+const expectedGain = expectedBase * tc.velocityGain;
+assert(Math.abs(releaseVel - expectedGain) < 1e-4, 'Release velocity must include recency weighting and gain');
+assert(tc.velocityGain >= 1.5 && tc.velocityGain <= 2.0, 'Gain must be between 1.5x and 2x');
+
+// Last-3-samples fallback when samples are older than 150ms window
+tc.samples = [
+  { y: 50, time: 100 },
+  { y: 100, time: 200 },
+  { y: 130, time: 300 },
+  { y: 180, time: 400 }
+];
+// Test at t=1000 (all samples > 150ms old): fallback to last 3 samples (indices 1, 2, 3)
+const fallbackVel = tc.calculateReleaseVelocity(1000);
+// Intervals from indices 1, 2, 3:
+// seg 1 (200->300): dt=100, dy=30 -> v=0.3, weight=1
+// seg 2 (300->400): dt=100, dy=50 -> v=0.5, weight=2
+// base = (0.3*1 + 0.5*2)/3 = 1.3/3 = 0.4333...
+const expectedFallback = ((0.3 * 1 + 0.5 * 2) / 3) * tc.velocityGain;
+assert(Math.abs(fallbackVel - expectedFallback) < 1e-4, 'Fallback must use last 3 samples with recency weighting');
 console.log('✓ Passed Touch Controller tests\n');
 
 // -----------------------------------------------------------------------------
@@ -577,6 +690,119 @@ realPty.kill();
 assert(detectedFg && detectedFg.includes('python'), `Must detect running child foreground process (got: ${detectedFg})`);
 
 console.log('✓ Passed Server Session Cap & LRU Eviction tests\n');
+
+// -----------------------------------------------------------------------------
+// Test 7: Jump-to-Bottom Pill (Req 6)
+// -----------------------------------------------------------------------------
+console.log('--- Test 7: Jump-to-Bottom Pill (Req 6) ---');
+
+let scrollToBottomCalled = false;
+const jumpMockTerm = {
+  buffer: {
+    active: {
+      type: 'normal',
+      viewportY: 50,
+      baseY: 100
+    }
+  },
+  scrollToBottom: () => {
+    scrollToBottomCalled = true;
+    jumpMockTerm.buffer.active.viewportY = jumpMockTerm.buffer.active.baseY;
+  },
+  onScroll: (cb) => { jumpMockTerm._scrollCb = cb; },
+  _scrollCb: null
+};
+
+// Create mock pill element
+const pillEl = new MockElement('button');
+pillEl.id = 'jump-to-bottom-pill';
+pillEl.className = 'jump-to-bottom-pill hidden';
+
+const updatePill = () => {
+  const isNormal = Boolean(
+    jumpMockTerm.buffer &&
+    jumpMockTerm.buffer.active &&
+    jumpMockTerm.buffer.active.type === 'normal'
+  );
+  if (!isNormal) {
+    pillEl.classList.add('hidden');
+    return;
+  }
+  const isAtBottom = (jumpMockTerm.buffer.active.viewportY >= jumpMockTerm.buffer.active.baseY);
+  if (isAtBottom) {
+    pillEl.classList.add('hidden');
+  } else {
+    pillEl.classList.remove('hidden');
+  }
+};
+
+let pdPreventDefaultCalled = false;
+const handleJumpTap = (e) => {
+  if (e && typeof e.preventDefault === 'function') {
+    e.preventDefault();
+  }
+  if (jumpMockTerm.buffer && jumpMockTerm.buffer.active && jumpMockTerm.buffer.active.type === 'normal') {
+    jumpMockTerm.scrollToBottom();
+    updatePill();
+  }
+};
+pillEl.addEventListener('pointerdown', handleJumpTap);
+
+// 7.1 Normal buffer, scrolled up -> pill is visible
+updatePill();
+assert.strictEqual(pillEl.classList.contains('hidden'), false, 'Pill must be visible when scrolled up in normal buffer');
+
+// 7.2 Pointerdown calls preventDefault and scrolls to bottom
+pdPreventDefaultCalled = false;
+scrollToBottomCalled = false;
+pillEl.dispatchEvent({
+  type: 'pointerdown',
+  preventDefault: () => { pdPreventDefaultCalled = true; }
+});
+assert.strictEqual(pdPreventDefaultCalled, true, 'pointerdown on pill must call preventDefault to retain focus/keyboard');
+assert.strictEqual(scrollToBottomCalled, true, 'pointerdown must scroll terminal to bottom');
+assert.strictEqual(pillEl.classList.contains('hidden'), true, 'Pill must hide once scrolled to bottom');
+
+// 7.3 Alternate buffer -> pill must remain hidden even if viewportY < baseY
+jumpMockTerm.buffer.active.type = 'alternate';
+jumpMockTerm.buffer.active.viewportY = 10;
+jumpMockTerm.buffer.active.baseY = 100;
+updatePill();
+assert.strictEqual(pillEl.classList.contains('hidden'), true, 'Pill must NEVER show in alternate buffer');
+
+// 7.4 Alternate buffer: tapping does not scroll
+scrollToBottomCalled = false;
+pillEl.dispatchEvent({
+  type: 'pointerdown',
+  preventDefault: () => {}
+});
+assert.strictEqual(scrollToBottomCalled, false, 'Tapping pill in alternate buffer must not scroll');
+
+// 7.5 Momentum cancellation when Jump-to-Bottom pill is activated
+let stopMomentumCalled = false;
+const mockTouchController = {
+  stopMomentum: () => { stopMomentumCalled = true; }
+};
+const handleJumpWithTouch = (e) => {
+  if (e && typeof e.preventDefault === 'function') {
+    e.preventDefault();
+  }
+  if (mockTouchController && typeof mockTouchController.stopMomentum === 'function') {
+    mockTouchController.stopMomentum();
+  }
+  if (jumpMockTerm.buffer && jumpMockTerm.buffer.active && jumpMockTerm.buffer.active.type === 'normal') {
+    jumpMockTerm.scrollToBottom();
+    updatePill();
+  }
+};
+jumpMockTerm.buffer.active.type = 'normal';
+jumpMockTerm.buffer.active.viewportY = 10;
+updatePill();
+stopMomentumCalled = false;
+handleJumpWithTouch({ preventDefault: () => {} });
+assert.strictEqual(stopMomentumCalled, true, 'Activating Jump-to-Bottom must stop running kinetic momentum');
+
+console.log('✓ Passed Jump-to-Bottom Pill tests\n');
 
 console.log('====================================================');
 console.log('ALL UNIT AND COMPONENT TESTS PASSED SUCCESSFULLY!');

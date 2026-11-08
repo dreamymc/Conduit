@@ -98,6 +98,7 @@ function resizeTerminal() {
     } else {
       term.scrollToLine(previousScrollY);
     }
+    updateJumpToBottomVisibility();
 
     if (ws && ws.readyState === WebSocket.OPEN) {
       if (term.cols !== lastCols || term.rows !== lastRows) {
@@ -122,9 +123,68 @@ resizeTerminal();
 let mobileDock = null;
 let powerSheet = null;
 let touchController = null;
+let jumpToBottomPillEl = null;
+
+function updateJumpToBottomVisibility() {
+  if (!jumpToBottomPillEl) return;
+  // (6) Spec Fix: normal buffer only
+  const isNormal = Boolean(
+    term &&
+    term.buffer &&
+    term.buffer.active &&
+    term.buffer.active.type === 'normal'
+  );
+  if (!isNormal) {
+    jumpToBottomPillEl.classList.add('hidden');
+    return;
+  }
+  const isAtBottom = (term.buffer.active.viewportY >= term.buffer.active.baseY);
+  if (isAtBottom) {
+    jumpToBottomPillEl.classList.add('hidden');
+  } else {
+    jumpToBottomPillEl.classList.remove('hidden');
+  }
+}
 
 if (isMobile) {
   const terminalContainerEl = document.getElementById('terminal-container');
+
+  // (6) Spec Fix: Jump-to-Bottom pill: normal buffer only, above the dock, pointerdown preventDefault
+  const jumpPill = document.createElement('button');
+  jumpPill.id = 'jump-to-bottom-pill';
+  jumpPill.className = 'jump-to-bottom-pill hidden';
+  jumpPill.setAttribute('type', 'button');
+  jumpPill.setAttribute('aria-label', 'Jump to bottom');
+  jumpPill.innerHTML = `
+    <span class="jump-icon">↓</span>
+    <span class="jump-label">Jump to bottom</span>
+  `;
+
+  const handleJump = (e) => {
+    e.preventDefault();
+    if (touchController && typeof touchController.stopMomentum === 'function') {
+      touchController.stopMomentum();
+    }
+    if (term.buffer && term.buffer.active && term.buffer.active.type === 'normal') {
+      term.scrollToBottom();
+      updateJumpToBottomVisibility();
+    }
+  };
+
+  // pointerdown preventDefault retains terminal focus and keeps virtual keyboard open
+  jumpPill.addEventListener('pointerdown', handleJump);
+  jumpPill.addEventListener('click', handleJump);
+
+  document.body.appendChild(jumpPill);
+  jumpToBottomPillEl = jumpPill;
+  updateJumpToBottomVisibility();
+
+  if (typeof term.onScroll === 'function') {
+    term.onScroll(updateJumpToBottomVisibility);
+  }
+  if (term.buffer && typeof term.buffer.onBufferChange === 'function') {
+    term.buffer.onBufferChange(updateJumpToBottomVisibility);
+  }
 
   if (window.TouchController && window.TouchController.TouchController) {
     touchController = new window.TouchController.TouchController(term, sendWsInput, {
@@ -223,6 +283,7 @@ function connectWebSocket() {
               const targetY = Math.max(0, term.buffer.active.baseY - bottomOffset);
               term.scrollToLine(targetY);
             }
+            updateJumpToBottomVisibility();
 
             // (2) Spec Fix: Force a TUI redraw via PTY resize bounce
             if (ws && ws.readyState === WebSocket.OPEN) {
@@ -245,7 +306,7 @@ function connectWebSocket() {
             }
           });
         } else {
-          term.write(msg.data);
+          term.write(msg.data, updateJumpToBottomVisibility);
         }
       } else if (msg.type === 'exit') {
         term.write(`\r\n\x1b[33m[Shell exited — ${msg.shell || activeShell} returned code ${msg.code}]\x1b[0m\r\n`);

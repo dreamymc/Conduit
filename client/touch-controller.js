@@ -103,12 +103,15 @@
       this.term = term;
       this.sendInput = sendInputCallback;
       this.container = options.container || (term ? term.element : null);
-      this.friction = options.friction || 0.94;
+      // (2) Spec Fix: Time-based friction decay: 0.975 ** (dt / 16.67) so 120Hz phones feel the same
+      this.friction = (options.friction !== undefined) ? options.friction : 0.975;
+      // (1) Spec Fix: Apply 1.5x to 2x gain only to fling release velocity
+      this.velocityGain = (options.velocityGain !== undefined) ? options.velocityGain : 1.75;
       this.velocityThreshold = 0.01; // px/ms
       this.longPressDelay = 500; // ms
 
       this.accumulator = new FractionalLineAccumulator(18);
-      this.samples = []; // Rolling 100ms window: [{ y, time }]
+      this.samples = []; // Rolling ~150ms window: [{ y, time }]
       this.animFrameId = null;
       this.copyTimer = null;
       this.copyPillEl = null;
@@ -228,7 +231,7 @@
       this.samples = [{ y: touch.clientY, time: this.lastTime }];
 
       // If user tapped outside copy pill while active, dismiss pill
-      if (this.isCopyModeActive && this.copyPillEl && !this.copyPillEl.contains(e.target)) {
+      if (this.isCopyModeActive && (!this.copyPillEl || !this.copyPillEl.contains(e.target))) {
         this.hideCopyPill();
       }
 
@@ -241,28 +244,33 @@
     _handleTouchMove(e) {
       if (e.touches.length === 0) return;
       const touch = e.touches[0];
+      const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
       const deltaX = touch.clientX - this.touchStartX;
       const deltaY = touch.clientY - this.touchStartY;
+      const dist = Math.hypot(deltaX, deltaY);
 
-      // Cancel copy timer and flag movement if finger moves > 10px
-      if (Math.hypot(deltaX, deltaY) > 10) {
+      // (4) Spec Fix: Any touchmove beyond 10px cancels the long-press timer and dismisses Copy Mode
+      if (dist > 10) {
         this.hasMoved = true;
         this.clearCopyTimer();
-      }
-
-      if (this.longPressTriggered || this.isCopyModeActive) {
+        if (this.isCopyModeActive || this.longPressTriggered) {
+          this.hideCopyPill();
+          // Reset samples to start from drag onset so stationary hold does not corrupt velocity
+          this.samples = [{ y: this.lastY, time: now - 16 }];
+        }
+      } else if (this.isCopyModeActive || this.longPressTriggered) {
+        // Micro-movements <= 10px while in Copy Mode: ignore jitter and suppress scroll
         e.preventDefault();
         return;
       }
 
       e.preventDefault();
 
-      const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
       const dy = touch.clientY - this.lastY;
 
-      // Rolling 100ms sample window
+      // (3) Spec Fix: Rolling ~150ms sample window with at least 3 samples kept as fallback
       this.samples.push({ y: touch.clientY, time: now });
-      while (this.samples.length > 0 && now - this.samples[0].time > 100) {
+      while (this.samples.length > 3 && (now - this.samples[0].time) > 150) {
         this.samples.shift();
       }
 
@@ -270,15 +278,62 @@
       this.lastY = touch.clientY;
       this.lastTime = now;
 
-      // Fractional line accumulator and step routing
+      // (1) Spec Fix: 1:1 drag tracking (unscaled displacement passed directly to accumulator)
       const step = this.accumulator.addDisplacement(dy);
       if (step !== 0) {
         this._routeScrollStep(step, touch.clientX, touch.clientY);
       }
     }
 
+    /**
+     * (3) Spec Fix: Velocity window ~150ms with a last-3-samples fallback and recency weighting.
+     * (1) Spec Fix: Applies 1.5x - 2x gain only to fling release velocity.
+     */
+    calculateReleaseVelocity(now = ((typeof performance !== 'undefined') ? performance.now() : Date.now())) {
+      let windowSamples = this.samples.filter(s => (now - s.time) <= 150);
+
+      // Last-3-samples fallback if fewer than 3 samples in window
+      if (windowSamples.length < 3 && this.samples.length >= 2) {
+        windowSamples = this.samples.slice(-3);
+      }
+
+      if (windowSamples.length < 2) {
+        return 0;
+      }
+
+      let weightedVelSum = 0;
+      let totalWeight = 0;
+
+      for (let i = 0; i < windowSamples.length - 1; i++) {
+        const sA = windowSamples[i];
+        const sB = windowSamples[i + 1];
+        const dt = sB.time - sA.time;
+        if (dt > 0) {
+          const segVel = (sB.y - sA.y) / dt;
+          // Recency weighting: more recent intervals get linearly higher weight (1, 2, 3...)
+          const weight = i + 1;
+          weightedVelSum += segVel * weight;
+          totalWeight += weight;
+        }
+      }
+
+      let baseVelocity = 0;
+      if (totalWeight > 0) {
+        baseVelocity = weightedVelSum / totalWeight;
+      } else {
+        const first = windowSamples[0];
+        const last = windowSamples[windowSamples.length - 1];
+        const totalDt = last.time - first.time;
+        if (totalDt > 0) {
+          baseVelocity = (last.y - first.y) / totalDt;
+        }
+      }
+
+      // (1) Apply 1.5x - 2x gain only to fling release velocity
+      return baseVelocity * this.velocityGain;
+    }
+
     _handleTouchEnd(e) {
-      // (5) Spec Fix: cancel on touchend
       this.clearCopyTimer();
 
       if (this.longPressTriggered) {
@@ -298,27 +353,26 @@
         return;
       }
 
-      // Calculate release velocity over rolling 100ms window
       const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-      while (this.samples.length > 0 && now - this.samples[0].time > 100) {
-        this.samples.shift();
-      }
-
-      if (this.samples.length >= 2) {
-        const first = this.samples[0];
-        const last = this.samples[this.samples.length - 1];
-        const dt = last.time - first.time;
-        if (dt > 10) {
-          this.velocity = (last.y - first.y) / dt; // px/ms
-          this._startMomentum();
-        }
+      const releaseVel = this.calculateReleaseVelocity(now);
+      // Only start momentum if finger was actively moving within ~150ms before release
+      if ((now - this.lastTime) <= 150 && Math.abs(releaseVel) >= this.velocityThreshold) {
+        this.velocity = releaseVel;
+        this._startMomentum();
       }
     }
 
     _handleTouchCancel() {
-      // (5) Spec Fix: cancel on touchcancel
       this.clearCopyTimer();
       this.stopMomentum();
+      if (this.isCopyModeActive || this.longPressTriggered) {
+        this.hideCopyPill();
+      }
+    }
+
+    getFrictionDecay(dt) {
+      // (2) Spec Fix: Time-based friction: 0.975 ** (dt / 16.67) so 120Hz phones feel the same
+      return Math.pow(this.friction, dt / 16.67);
     }
 
     _startMomentum() {
@@ -329,8 +383,12 @@
 
       let lastAnimTime = (typeof performance !== 'undefined') ? performance.now() : Date.now();
 
+      const raf = (typeof requestAnimationFrame === 'function')
+        ? requestAnimationFrame
+        : (fn) => setTimeout(() => fn((typeof performance !== 'undefined') ? performance.now() : Date.now()), 16);
+
       const stepMomentum = (currentTime) => {
-        const dt = currentTime - lastAnimTime;
+        const dt = Math.max(1, currentTime - lastAnimTime);
         lastAnimTime = currentTime;
 
         if (Math.abs(this.velocity) < this.velocityThreshold) {
@@ -339,17 +397,31 @@
         }
 
         const dy = this.velocity * dt;
-        this.velocity *= this.friction;
+
+        // (2) Time-based friction: 0.975 ** (dt / 16.67)
+        this.velocity *= this.getFrictionDecay(dt);
 
         const step = this.accumulator.addDisplacement(dy);
         if (step !== 0) {
           this._routeScrollStep(step, this.lastX, this.lastY);
         }
 
-        this.animFrameId = requestAnimationFrame(stepMomentum);
+        this.animFrameId = raf(stepMomentum);
       };
 
-      this.animFrameId = requestAnimationFrame(stepMomentum);
+      this.animFrameId = raf(stepMomentum);
+    }
+
+    stopMomentum() {
+      if (this.animFrameId) {
+        if (typeof cancelAnimationFrame === 'function') {
+          cancelAnimationFrame(this.animFrameId);
+        } else {
+          clearTimeout(this.animFrameId);
+        }
+        this.animFrameId = null;
+      }
+      this.velocity = 0;
     }
 
     /**
@@ -563,7 +635,6 @@
       }
       this.isCopyModeActive = false;
       this.longPressTriggered = false;
-      this.hasMoved = false;
     }
   }
 
