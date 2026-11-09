@@ -849,6 +849,58 @@ modeBtn.dispatchEvent({
 });
 assert.strictEqual(ball.mode, 'highlight', 'Immediate click after pointerdown must be deduplicated and not double-cycle');
 
+// 5.10 Highlight Helper Mechanics (Mode 3: Green)
+ball.setMode('highlight');
+assert.strictEqual(ball.mode, 'highlight');
+
+let mockSelections = [];
+mockTerm.select = (col, row, len) => {
+  mockSelections.push({ col, row, len });
+};
+mockTerm.cols = 80;
+mockTerm.buffer.active.cursorX = 12;
+mockTerm.buffer.active.cursorY = 5;
+mockTerm.buffer.active.viewportY = 100; // buffer row = 105
+
+ballSentInputs = [];
+ballScrolledSteps = [];
+
+// 5.10.1 Dragging nub in highlight mode does NOT send ANSI/VT keys to sendInput and does NOT scroll
+ball.isDragging = true;
+ball.dragMode = 'highlight';
+ball._updateNubPosition(20, 0); // drag right 20px
+assert.strictEqual(ballSentInputs.length, 0, 'Highlight mode must NOT send keystrokes to shell');
+assert.strictEqual(ballScrolledSteps.length, 0, 'Highlight mode must NOT scroll terminal');
+
+// 5.10.2 Dragging right expands selection length (+1 character)
+assert(mockSelections.length > 0, 'Dragging right must call term.select');
+const lastSelRight = mockSelections[mockSelections.length - 1];
+assert.strictEqual(lastSelRight.col, 12, 'Selection should start at cursor column (12)');
+assert.strictEqual(lastSelRight.row, 105, 'Selection should start at buffer row (105)');
+assert(lastSelRight.len >= 2, 'Dragging right must expand selection length');
+
+// 5.10.3 Dragging down expands selection by cols (80)
+const curLen = ball.highlightSelection.length;
+ball._updateNubPosition(0, 20); // drag down 20px
+const lastSelDown = mockSelections[mockSelections.length - 1];
+assert.strictEqual(lastSelDown.len, curLen + 80, 'Dragging down must expand selection by 1 line (80 cols)');
+
+// 5.10.4 Dragging up contracts selection by cols (80)
+ball._updateNubPosition(0, -20); // drag up 20px
+const lastSelUp = mockSelections[mockSelections.length - 1];
+assert.strictEqual(lastSelUp.len, curLen, 'Dragging up must contract selection by 1 line');
+
+// 5.10.5 Dragging left contracts selection length
+ball._updateNubPosition(-20, 0); // drag left 20px
+const lastSelLeft = mockSelections[mockSelections.length - 1];
+assert.strictEqual(lastSelLeft.len, curLen - 1, 'Dragging left must contract selection length');
+
+// 5.10.6 Release snaps nub to center but preserves terminal highlight
+ball._resetNub();
+assert.strictEqual(ball.isDragging, false);
+assert.strictEqual(ball.nubEl.style.transform, 'translate(0px, 0px)');
+assert.notStrictEqual(ball.highlightSelection, null, 'Highlight selection state must be preserved on release for copy dock button');
+
 // Reset mode to scroll for any subsequent tests
 ball.setMode('scroll');
 

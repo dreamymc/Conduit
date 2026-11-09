@@ -79,6 +79,12 @@
       this.activeArrowDirection = null;
       this._activeListenerType = null;
 
+      // Highlight Mode State
+      this.highlightSelection = null;
+      this.activeHighlightDirection = null;
+      this.highlightTimer = null;
+      this.highlightIntervalTimer = null;
+
       // DOM Elements
       this.element = null;
       this.modeBtnEl = null;
@@ -381,6 +387,122 @@
       this.activeArrowDirection = null;
     }
 
+    _initHighlightSelection() {
+      const cols = (this.term && this.term.cols) || 80;
+      if (this.term && typeof this.term.hasSelection === 'function' && this.term.hasSelection()) {
+        if (typeof this.term.getSelectionPosition === 'function') {
+          const pos = this.term.getSelectionPosition();
+          if (pos && (pos.start || pos.startColumn !== undefined)) {
+            const sx = pos.start ? pos.start.x : pos.startColumn;
+            const sy = pos.start ? pos.start.y : pos.startRow;
+            const ex = pos.end ? pos.end.x : pos.endColumn;
+            const ey = pos.end ? pos.end.y : pos.endRow;
+            const len = Math.max(1, (ey - sy) * cols + (ex - sx));
+            this.highlightSelection = { startCol: sx, startRow: sy, length: len };
+            return;
+          }
+        }
+        if (typeof this.term.getSelection === 'function') {
+          const str = this.term.getSelection() || '';
+          if (str.length > 0 && this.highlightSelection) {
+            this.highlightSelection.length = str.length;
+            return;
+          }
+        }
+      }
+
+      if (!this.highlightSelection) {
+        let startCol = 0;
+        let startRow = 0;
+        if (this.term && this.term.buffer && this.term.buffer.active) {
+          startCol = this.term.buffer.active.cursorX || 0;
+          startRow = (this.term.buffer.active.viewportY || 0) + (this.term.buffer.active.cursorY || 0);
+        }
+        this.highlightSelection = { startCol, startRow, length: 1 };
+      }
+      if (this.term && typeof this.term.select === 'function') {
+        this.term.select(this.highlightSelection.startCol, this.highlightSelection.startRow, this.highlightSelection.length);
+      }
+    }
+
+    _stepHighlight(direction) {
+      if (!direction) return;
+      if (!this.highlightSelection) {
+        this._initHighlightSelection();
+      }
+      const cols = (this.term && this.term.cols) || 80;
+      let len = this.highlightSelection.length;
+
+      switch (direction) {
+        case 'right':
+          len += 1;
+          break;
+        case 'left':
+          len = Math.max(1, len - 1);
+          break;
+        case 'down':
+          len += cols;
+          break;
+        case 'up':
+          len = Math.max(1, len - cols);
+          break;
+      }
+
+      this.highlightSelection.length = len;
+      if (this.term && typeof this.term.select === 'function') {
+        this.term.select(this.highlightSelection.startCol, this.highlightSelection.startRow, len);
+      }
+    }
+
+    _startHighlightRepeat(direction) {
+      this._stopHighlightRepeat();
+      if (!direction) return;
+
+      this.activeHighlightDirection = direction;
+      this._stepHighlight(direction);
+
+      const dist = Math.hypot(this.dx, this.dy);
+      const effectiveDist = Math.max(0, dist - this.deadzone);
+      const maxDist = Math.max(1, this.maxRadius - this.deadzone);
+      const norm = Math.min(1, effectiveDist / maxDist);
+      const interval = this.maxArrowInterval - (this.maxArrowInterval - this.minArrowInterval) * norm;
+
+      this.highlightTimer = setTimeout(() => {
+        this._highlightRepeatLoop(interval);
+      }, this.arrowRepeatDelay);
+    }
+
+    _highlightRepeatLoop(currentInterval) {
+      if (!this.isDragging || this.dragMode !== 'highlight' || !this.activeHighlightDirection) {
+        this._stopHighlightRepeat();
+        return;
+      }
+
+      this._stepHighlight(this.activeHighlightDirection);
+
+      const dist = Math.hypot(this.dx, this.dy);
+      const effectiveDist = Math.max(0, dist - this.deadzone);
+      const maxDist = Math.max(1, this.maxRadius - this.deadzone);
+      const norm = Math.min(1, effectiveDist / maxDist);
+      const nextInterval = this.maxArrowInterval - (this.maxArrowInterval - this.minArrowInterval) * norm;
+
+      this.highlightIntervalTimer = setTimeout(() => {
+        this._highlightRepeatLoop(nextInterval);
+      }, nextInterval);
+    }
+
+    _stopHighlightRepeat() {
+      if (this.highlightTimer) {
+        clearTimeout(this.highlightTimer);
+        this.highlightTimer = null;
+      }
+      if (this.highlightIntervalTimer) {
+        clearTimeout(this.highlightIntervalTimer);
+        this.highlightIntervalTimer = null;
+      }
+      this.activeHighlightDirection = null;
+    }
+
     _updateNubPosition(rawDx, rawDy) {
       const dist = Math.hypot(rawDx, rawDy);
       if (dist > this.maxRadius && dist > 0) {
@@ -397,12 +519,31 @@
       }
 
       if (!this.dragMode) {
-        this.dragMode = this.isTextHighlighted() ? 'arrow' : 'scroll';
+        if (this.mode === 'highlight') {
+          this.dragMode = 'highlight';
+        } else if (this.mode === 'arrow' || this.isTextHighlighted()) {
+          this.dragMode = 'arrow';
+        } else {
+          this.dragMode = 'scroll';
+        }
       }
 
-      // Mode check: text highlighted vs continuous scrolling
-      if (this.dragMode === 'arrow') {
+      // Mode check: highlight helper vs arrow keys vs continuous scrolling
+      if (this.dragMode === 'highlight') {
         this._stopScrolling();
+        this._stopArrowRepeat();
+
+        const newDir = this.getArrowDirection(this.dx, this.dy);
+        if (newDir !== this.activeHighlightDirection) {
+          if (newDir) {
+            this._startHighlightRepeat(newDir);
+          } else {
+            this._stopHighlightRepeat();
+          }
+        }
+      } else if (this.dragMode === 'arrow') {
+        this._stopScrolling();
+        this._stopHighlightRepeat();
         if (this.element) this.element.classList.add('arrow-mode');
 
         const newDir = this.getArrowDirection(this.dx, this.dy);
@@ -415,6 +556,7 @@
         }
       } else {
         this._stopArrowRepeat();
+        this._stopHighlightRepeat();
         if (this.element) this.element.classList.remove('arrow-mode');
 
         if (!this.animFrameId) {
@@ -430,6 +572,7 @@
       this.dy = 0;
       this._stopScrolling();
       this._stopArrowRepeat();
+      this._stopHighlightRepeat();
       this._removeWindowListeners();
 
       if (this.nubEl) {
