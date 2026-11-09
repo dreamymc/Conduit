@@ -8,6 +8,27 @@
 })(typeof self !== 'undefined' ? self : this, function(CursorHelper) {
   'use strict';
 
+  const MODE_INFO = {
+    scroll: {
+      icon: '↕',
+      label: 'SCRL',
+      className: 'mode-scroll',
+      title: 'Mode: Scroll'
+    },
+    arrow: {
+      icon: '✛',
+      label: 'ARW',
+      className: 'mode-arrow',
+      title: 'Mode: Arrows'
+    },
+    highlight: {
+      icon: '✦',
+      label: 'SEL',
+      className: 'mode-highlight',
+      title: 'Mode: Highlight'
+    }
+  };
+
   /**
    * ScrollBall Component:
    * Middle-mouse style autoscroll ball located at middle-right of the screen.
@@ -15,7 +36,7 @@
    * 1. Draggable inner nub that snaps back to center on release.
    * 2. Visual up and down triangle arrows.
    * 3. Proportional continuous scrolling when dragged up/down (slight = slow, far = fast).
-   * 4. Arrow navigation mode (up/down/left/right) when terminal text is highlighted.
+   * 4. 3-mode operation (Scroll, Arrow, Highlight) toggled via button above ball.
    */
   class ScrollBall {
     constructor(options = {}) {
@@ -24,6 +45,13 @@
       this.onScroll = options.onScroll || null;
       this.isHighlightedCallback = options.isHighlighted || null;
       this.container = options.container || null;
+
+      // 3-Mode State Machine
+      this.modes = ['scroll', 'arrow', 'highlight'];
+      this.mode = (options.initialMode && this.modes.includes(options.initialMode))
+        ? options.initialMode
+        : 'scroll';
+      this.lastModeTapTime = 0;
 
       // Physics & geometry
       this.maxRadius = options.maxRadius || 26; // max nub distance from center (px)
@@ -38,7 +66,7 @@
 
       // State
       this.isDragging = false;
-      this.dragMode = null; // 'arrow' | 'scroll' | null
+      this.dragMode = null; // 'arrow' | 'scroll' | 'highlight' | null
       this.dx = 0;
       this.dy = 0;
       this.centerX = 0;
@@ -53,6 +81,8 @@
 
       // DOM Elements
       this.element = null;
+      this.modeBtnEl = null;
+      this.discEl = null;
       this.nubEl = null;
 
       // Bound handlers
@@ -63,6 +93,78 @@
       this._boundTouchMove = this._handleTouchMove.bind(this);
       this._boundTouchEnd = this._handleTouchEnd.bind(this);
       this._boundStepScroll = this._stepScroll.bind(this);
+      this._boundModePointerDown = this._handleModePointerDown.bind(this);
+      this._boundModeClick = this._handleModeClick.bind(this);
+    }
+
+    /**
+     * Set mode explicitly: 'scroll' | 'arrow' | 'highlight'.
+     * Returns true on success, false if invalid mode.
+     */
+    setMode(newMode) {
+      if (!this.modes.includes(newMode)) {
+        return false;
+      }
+      this.mode = newMode;
+      this._updateModeUI();
+      return true;
+    }
+
+    /**
+     * Cycles sequentially through available modes:
+     * 'scroll' -> 'arrow' -> 'highlight' -> 'scroll'
+     */
+    cycleMode() {
+      const currIdx = this.modes.indexOf(this.mode);
+      const nextIdx = (currIdx + 1) % this.modes.length;
+      this.setMode(this.modes[nextIdx]);
+      return this.mode;
+    }
+
+    /**
+     * Updates DOM element classes and mode button attributes/icons.
+     */
+    _updateModeUI() {
+      if (!this.element) return;
+      const info = MODE_INFO[this.mode] || MODE_INFO.scroll;
+
+      this.modes.forEach(m => {
+        const c = MODE_INFO[m].className;
+        this.element.classList.remove(c);
+        if (this.modeBtnEl) {
+          this.modeBtnEl.classList.remove(c);
+        }
+      });
+
+      this.element.classList.add(info.className);
+      if (this.modeBtnEl) {
+        this.modeBtnEl.classList.add(info.className);
+        this.modeBtnEl.setAttribute('title', info.title);
+
+        const iconEl = this.modeBtnEl.querySelector('.mode-icon');
+        const labelEl = this.modeBtnEl.querySelector('.mode-label');
+        if (iconEl) iconEl.textContent = info.icon;
+        if (labelEl) labelEl.textContent = info.label;
+      }
+    }
+
+    _handleModePointerDown(e) {
+      if (e.button !== undefined && e.button !== 0) return;
+      if (e.preventDefault) e.preventDefault();
+      if (e.stopPropagation) e.stopPropagation();
+      this.lastModeTapTime = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+      this.cycleMode();
+    }
+
+    _handleModeClick(e) {
+      if (e.preventDefault) e.preventDefault();
+      if (e.stopPropagation) e.stopPropagation();
+      const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+      if (this.lastModeTapTime > 0 && (now - this.lastModeTapTime < 300)) {
+        return; // Deduplicate pointerdown + click within 300ms
+      }
+      this.lastModeTapTime = now;
+      this.cycleMode();
     }
 
     /**
@@ -341,22 +443,32 @@
     }
 
     _computeCenter() {
-      if (!this.element) return;
-      if (typeof this.element.getBoundingClientRect === 'function') {
-        const rect = this.element.getBoundingClientRect();
+      const target = this.discEl || this.element;
+      if (!target) return;
+      if (typeof target.getBoundingClientRect === 'function') {
+        const rect = target.getBoundingClientRect();
         this.centerX = rect.left + rect.width / 2;
         this.centerY = rect.top + rect.height / 2;
       }
     }
 
     _handlePointerDown(e) {
+      if (e.target && e.target.closest && e.target.closest('.scroll-ball-mode-btn')) {
+        return;
+      }
       if (e.button !== undefined && e.button !== 0) return;
       if (e.preventDefault) e.preventDefault();
       if (e.stopPropagation) e.stopPropagation();
 
       this._computeCenter();
       this.isDragging = true;
-      this.dragMode = this.isTextHighlighted() ? 'arrow' : 'scroll';
+      if (this.mode === 'highlight') {
+        this.dragMode = 'highlight';
+      } else if (this.mode === 'arrow' || this.isTextHighlighted()) {
+        this.dragMode = 'arrow';
+      } else {
+        this.dragMode = 'scroll';
+      }
       if (this.element) {
         this.element.classList.add('active');
         if (this.dragMode === 'arrow') {
@@ -387,13 +499,22 @@
     }
 
     _handleTouchStart(e) {
+      if (e.target && e.target.closest && e.target.closest('.scroll-ball-mode-btn')) {
+        return;
+      }
       if (e.touches && e.touches.length !== 1) return;
       if (e.preventDefault) e.preventDefault();
       if (e.stopPropagation) e.stopPropagation();
 
       this._computeCenter();
       this.isDragging = true;
-      this.dragMode = this.isTextHighlighted() ? 'arrow' : 'scroll';
+      if (this.mode === 'highlight') {
+        this.dragMode = 'highlight';
+      } else if (this.mode === 'arrow' || this.isTextHighlighted()) {
+        this.dragMode = 'arrow';
+      } else {
+        this.dragMode = 'scroll';
+      }
       if (this.element) {
         this.element.classList.add('active');
         if (this.dragMode === 'arrow') {
@@ -435,6 +556,10 @@
       ball.setAttribute('role', 'toolbar');
       ball.setAttribute('aria-label', 'Scroll Ball navigation');
       ball.innerHTML = `
+        <button id="scroll-ball-mode-btn" class="scroll-ball-mode-btn" type="button" aria-label="Toggle navigation mode">
+          <span class="mode-icon">↕</span>
+          <span class="mode-label">SCRL</span>
+        </button>
         <div class="scroll-ball-disc">
           <div class="scroll-arrow arrow-up" aria-hidden="true">▲</div>
           <div class="scroll-arrow arrow-down" aria-hidden="true">▼</div>
@@ -447,7 +572,15 @@
       `;
 
       this.element = ball;
+      this.modeBtnEl = ball.querySelector('#scroll-ball-mode-btn');
+      this.discEl = ball.querySelector('.scroll-ball-disc');
       this.nubEl = ball.querySelector('.scroll-ball-nub');
+
+      if (this.modeBtnEl) {
+        this.modeBtnEl.addEventListener('pointerdown', this._boundModePointerDown);
+        this.modeBtnEl.addEventListener('click', this._boundModeClick);
+        this.modeBtnEl.addEventListener('touchstart', this._boundModePointerDown, { passive: false });
+      }
 
       // Use Pointer Events when supported, fallback to touch
       if (typeof window !== 'undefined' && window.PointerEvent) {
@@ -457,6 +590,7 @@
         ball.addEventListener('mousedown', this._boundPointerDown);
       }
 
+      this._updateModeUI();
       this.syncArrowMode();
       return ball;
     }
@@ -469,12 +603,18 @@
       if (this.container && this.element) {
         this.container.appendChild(this.element);
       }
+      this._updateModeUI();
       this.syncArrowMode();
       return this.element;
     }
 
     unmount() {
       this._resetNub();
+      if (this.modeBtnEl) {
+        this.modeBtnEl.removeEventListener('pointerdown', this._boundModePointerDown);
+        this.modeBtnEl.removeEventListener('click', this._boundModeClick);
+        this.modeBtnEl.removeEventListener('touchstart', this._boundModePointerDown);
+      }
       if (this.element && this.element.parentNode) {
         this.element.removeEventListener('pointerdown', this._boundPointerDown);
         this.element.removeEventListener('touchstart', this._boundTouchStart);
@@ -482,6 +622,8 @@
         this.element.parentNode.removeChild(this.element);
       }
       this.element = null;
+      this.modeBtnEl = null;
+      this.discEl = null;
       this.nubEl = null;
     }
   }

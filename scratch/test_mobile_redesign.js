@@ -407,7 +407,17 @@ class MockElement {
     this.value = '';
     this.style = {};
     this.parentNode = null;
-    this.textContent = '';
+    this._textContent = '';
+  }
+  get textContent() {
+    if (this._textContent !== undefined && this._textContent !== '') return this._textContent;
+    if (this.children.length > 0) {
+      return this.children.map(c => c.textContent).join('');
+    }
+    return this._textContent || '';
+  }
+  set textContent(val) {
+    this._textContent = val;
   }
   set id(val) { this.attributes['id'] = val; }
   get id() { return this.attributes['id'] || ''; }
@@ -512,6 +522,10 @@ class MockElement {
     const results = [];
     const check = (el) => {
       let match = true;
+      if (selector.includes('#')) {
+        const idMatch = selector.match(/#([a-zA-Z0-9_-]+)/);
+        if (idMatch && el.id !== idMatch[1]) match = false;
+      }
       if (selector.includes('.')) {
         const classes = selector.match(/\.([a-zA-Z0-9_-]+)/g);
         if (classes) {
@@ -724,6 +738,119 @@ assert.strictEqual(ballEl.classList.contains('arrow-mode'), true, 'syncArrowMode
 isHighlightedMock = false;
 ball.syncArrowMode();
 assert.strictEqual(ballEl.classList.contains('arrow-mode'), false, 'syncArrowMode must remove arrow-mode when selection cleared');
+
+// 5.9 Scroll Ball 3-Mode State Machine & Mode Button (Task 1)
+// 5.9.1 ball.mode defaults to 'scroll'
+assert.strictEqual(ball.mode, 'scroll', 'ball.mode must default to "scroll"');
+
+// 5.9.2 Mode button rendered directly above .scroll-ball-disc
+const modeBtn = ballEl.querySelector('#scroll-ball-mode-btn');
+assert.notStrictEqual(modeBtn, null, 'ScrollBall must render #scroll-ball-mode-btn');
+assert.strictEqual(modeBtn.classList.contains('scroll-ball-mode-btn'), true, 'Mode button must have class scroll-ball-mode-btn');
+assert.strictEqual(modeBtn.getAttribute('type'), 'button', 'Mode button must have type="button"');
+assert.strictEqual(modeBtn.getAttribute('aria-label'), 'Toggle navigation mode', 'Mode button must have aria-label');
+
+const discEl = ballEl.querySelector('.scroll-ball-disc');
+assert.notStrictEqual(discEl, null, 'ScrollBall must contain .scroll-ball-disc');
+const btnIdx = ballEl.children.indexOf(modeBtn);
+const discIdx = ballEl.children.indexOf(discEl);
+assert.strictEqual(btnIdx !== -1 && discIdx !== -1 && btnIdx < discIdx, true, 'Mode button must be positioned directly above .scroll-ball-disc inside .scroll-ball');
+
+// Initial mode 'scroll' appearance
+assert.strictEqual(ballEl.classList.contains('mode-scroll'), true, 'Container must have mode-scroll class in scroll mode');
+assert.strictEqual(modeBtn.classList.contains('mode-scroll'), true, 'Mode button must have mode-scroll class in scroll mode');
+const scrollIcon = modeBtn.querySelector('.mode-icon');
+const scrollLabel = modeBtn.querySelector('.mode-label');
+assert.notStrictEqual(scrollIcon, null, 'Mode button must contain .mode-icon');
+assert.notStrictEqual(scrollLabel, null, 'Mode button must contain .mode-label');
+assert.strictEqual(scrollIcon.textContent.trim(), '↕', 'Scroll mode icon must be ↕');
+assert.strictEqual(scrollLabel.textContent.trim(), 'SCRL', 'Scroll mode label must be SCRL');
+
+// 5.9.3 ball.setMode(newMode) validates and sets mode, updating DOM classes & text/icons
+// Switch to 'arrow'
+ball.setMode('arrow');
+assert.strictEqual(ball.mode, 'arrow', 'ball.mode must be "arrow" after setMode("arrow")');
+assert.strictEqual(ballEl.classList.contains('mode-arrow'), true, 'Container must have mode-arrow');
+assert.strictEqual(ballEl.classList.contains('mode-scroll'), false, 'Container must not have mode-scroll');
+assert.strictEqual(modeBtn.classList.contains('mode-arrow'), true, 'Mode button must have mode-arrow');
+assert.strictEqual(modeBtn.classList.contains('mode-scroll'), false, 'Mode button must not have mode-scroll');
+assert.strictEqual(scrollIcon.textContent.trim(), '✛', 'Arrow mode icon must be ✛');
+assert.strictEqual(scrollLabel.textContent.trim(), 'ARW', 'Arrow mode label must be ARW');
+
+// Switch to 'highlight'
+ball.setMode('highlight');
+assert.strictEqual(ball.mode, 'highlight', 'ball.mode must be "highlight" after setMode("highlight")');
+assert.strictEqual(ballEl.classList.contains('mode-highlight'), true, 'Container must have mode-highlight');
+assert.strictEqual(ballEl.classList.contains('mode-arrow'), false, 'Container must not have mode-arrow');
+assert.strictEqual(modeBtn.classList.contains('mode-highlight'), true, 'Mode button must have mode-highlight');
+assert.strictEqual(modeBtn.classList.contains('mode-arrow'), false, 'Mode button must not have mode-arrow');
+assert.strictEqual(scrollIcon.textContent.trim(), '✦', 'Highlight mode icon must be ✦');
+assert.strictEqual(scrollLabel.textContent.trim(), 'SEL', 'Highlight mode label must be SEL');
+
+// Invalid mode rejection
+const invalidRes = ball.setMode('teleport');
+assert.strictEqual(invalidRes, false, 'setMode with invalid mode must return false');
+assert.strictEqual(ball.mode, 'highlight', 'Invalid mode must not change ball.mode');
+
+// Switch back to 'scroll'
+ball.setMode('scroll');
+assert.strictEqual(ball.mode, 'scroll');
+assert.strictEqual(ballEl.classList.contains('mode-scroll'), true);
+assert.strictEqual(scrollIcon.textContent.trim(), '↕');
+assert.strictEqual(scrollLabel.textContent.trim(), 'SCRL');
+
+// 5.9.4 ball.cycleMode() cycles sequentially: scroll -> arrow -> highlight -> scroll
+assert.strictEqual(ball.cycleMode(), 'arrow', 'cycleMode from scroll must return arrow');
+assert.strictEqual(ball.mode, 'arrow');
+assert.strictEqual(ballEl.classList.contains('mode-arrow'), true);
+
+assert.strictEqual(ball.cycleMode(), 'highlight', 'cycleMode from arrow must return highlight');
+assert.strictEqual(ball.mode, 'highlight');
+assert.strictEqual(ballEl.classList.contains('mode-highlight'), true);
+
+assert.strictEqual(ball.cycleMode(), 'scroll', 'cycleMode from highlight must return scroll');
+assert.strictEqual(ball.mode, 'scroll');
+assert.strictEqual(ballEl.classList.contains('mode-scroll'), true);
+
+// 5.9.5 Mode button interaction: clicking or pointerdown triggers cycleMode()
+// with preventDefault() and stopPropagation()
+let clickPreventDefault = false;
+let clickStopProp = false;
+modeBtn.dispatchEvent({
+  type: 'click',
+  target: modeBtn,
+  preventDefault: () => { clickPreventDefault = true; },
+  stopPropagation: () => { clickStopProp = true; }
+});
+assert.strictEqual(clickPreventDefault, true, 'Clicking mode button must call preventDefault()');
+assert.strictEqual(clickStopProp, true, 'Clicking mode button must call stopPropagation()');
+assert.strictEqual(ball.mode, 'arrow', 'Clicking mode button must cycle mode to arrow');
+
+// Pointerdown on mode button triggers cycleMode() and does NOT start drag
+let pdPreventDefault = false;
+let pdStopProp = false;
+modeBtn.dispatchEvent({
+  type: 'pointerdown',
+  target: modeBtn,
+  preventDefault: () => { pdPreventDefault = true; },
+  stopPropagation: () => { pdStopProp = true; }
+});
+assert.strictEqual(pdPreventDefault, true, 'Pointerdown on mode button must call preventDefault()');
+assert.strictEqual(pdStopProp, true, 'Pointerdown on mode button must call stopPropagation()');
+assert.strictEqual(ball.mode, 'highlight', 'Pointerdown on mode button must cycle mode to highlight');
+assert.strictEqual(ball.isDragging, false, 'Pointerdown on mode button must NOT trigger nub drag');
+
+// Deduplication: immediate click (<300ms) after pointerdown must be ignored
+modeBtn.dispatchEvent({
+  type: 'click',
+  target: modeBtn,
+  preventDefault: () => {},
+  stopPropagation: () => {}
+});
+assert.strictEqual(ball.mode, 'highlight', 'Immediate click after pointerdown must be deduplicated and not double-cycle');
+
+// Reset mode to scroll for any subsequent tests
+ball.setMode('scroll');
 
 console.log('✓ Passed Scroll Ball tests\n');
 
