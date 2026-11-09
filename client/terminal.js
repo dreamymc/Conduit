@@ -139,7 +139,12 @@ if (isMobile) {
     touchController = new window.TouchController.TouchController(term, sendWsInput, {
       container: terminalContainerEl,
       onCopyModeChange: () => {
-        if (scrollBall) scrollBall.syncArrowMode();
+        if (scrollBall) {
+          scrollBall.syncArrowMode();
+          if (scrollBall.mode === 'highlight' && term && typeof term.hasSelection === 'function' && term.hasSelection()) {
+            scrollBall._initHighlightSelection();
+          }
+        }
       }
     });
   }
@@ -165,7 +170,12 @@ if (isMobile) {
 
     if (typeof term.onSelectionChange === 'function') {
       term.onSelectionChange(() => {
-        if (scrollBall) scrollBall.syncArrowMode();
+        if (scrollBall) {
+          scrollBall.syncArrowMode();
+          if (scrollBall.mode === 'highlight' && typeof term.hasSelection === 'function' && term.hasSelection()) {
+            scrollBall._initHighlightSelection();
+          }
+        }
       });
     }
   }
@@ -179,6 +189,7 @@ if (isMobile) {
           touchController.hideCopyPill();
         }
         if (scrollBall) {
+          scrollBall.highlightSelection = null;
           scrollBall.syncArrowMode();
         }
       },
