@@ -254,6 +254,47 @@ function spawnSession(sessionId, session, shellName) {
  * Binds message and close event handlers of a WebSocket connection to a session.
  */
 function bindSocketToSession(ws, sessionId, session) {
+  // (4) ws ping/pong heartbeat: server ping every 25s, terminate on missed pong
+  ws.isAlive = true;
+  const pongHandler = () => {
+    ws.isAlive = true;
+  };
+  if (typeof ws.on === 'function') {
+    ws.on('pong', pongHandler);
+  }
+
+  const pingInterval = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) {
+      clearInterval(pingInterval);
+      return;
+    }
+    if (ws.isAlive === false) {
+      console.log(`[Heartbeat] Terminating inactive WebSocket for session ${sessionId} due to missed pong.`);
+      clearInterval(pingInterval);
+      if (typeof ws.terminate === 'function') {
+        return ws.terminate();
+      } else if (typeof ws.close === 'function') {
+        return ws.close();
+      }
+      return;
+    }
+    ws.isAlive = false;
+    if (typeof ws.ping === 'function') {
+      ws.ping();
+    }
+  }, 25000);
+  if (typeof pingInterval.unref === 'function') {
+    pingInterval.unref();
+  }
+
+  const errorHandler = (err) => {
+    console.error(`WebSocket error for session ${sessionId}:`, err);
+    clearInterval(pingInterval);
+  };
+  if (typeof ws.on === 'function') {
+    ws.on('error', errorHandler);
+  }
+
   const messageHandler = (message) => {
     try {
       session.lastActiveTime = Date.now();
@@ -312,6 +353,10 @@ function bindSocketToSession(ws, sessionId, session) {
   };
 
   const closeHandler = (code, reason) => {
+    clearInterval(pingInterval);
+    ws.removeListener('pong', pongHandler);
+    ws.removeListener('error', errorHandler);
+
     if (session.ws !== ws) {
       return;
     }
@@ -327,7 +372,7 @@ function bindSocketToSession(ws, sessionId, session) {
       session.ws = null;
       session.disconnectTimeout = setTimeout(() => {
         cleanupSession(sessionId);
-      }, 60000);
+      }, config.SESSION_IDLE_TIMEOUT_MS);
     }
   };
 
@@ -363,9 +408,14 @@ function spawnTerminal(ws, sessionId, initialShell = 'bash', jti = null) {
       }
     }
 
-    // Send the rolling 512KB scrollback history buffer
+    // (2) Send session-resumed notification
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'session-resumed', sessionId }));
+    }
+
+    // (3) Send explicit replay message instead of regular output
     if (session.buffer && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: 'output', data: session.buffer }));
+      ws.send(JSON.stringify({ type: 'replay', data: session.buffer }));
     }
 
     // Send the active shell state notification
@@ -448,6 +498,11 @@ function spawnTerminal(ws, sessionId, initialShell = 'bash', jti = null) {
 
     // Spawn the initial PTY process
     spawnSession(sessionId, session, initialShell);
+
+    // (2) Send session-new notification
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'session-new', sessionId }));
+    }
 
     // Bind WebSocket message handlers and close handler to this session
     bindSocketToSession(ws, sessionId, session);

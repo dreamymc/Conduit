@@ -111,7 +111,7 @@ function verifyReconnectAndBounce() {
 
         ws2.on('message', (data) => {
           const msg = JSON.parse(data);
-          if (msg.type === 'output') {
+          if (msg.type === 'replay' || msg.type === 'output') {
             replayedData += msg.data;
 
             if (!bounceRowsDecremented && replayedData.includes('MARKER_START_') && replayedData.includes('_MARKER_END')) {

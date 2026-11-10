@@ -34,7 +34,6 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const BACKOFF_DELAYS = [2000, 4000, 8000, 16000, 30000];
 let reconnectTimer = null;
-let isReconnectingReplay = false;
 
 // DOM element references for reconnection
 const reconnectOverlay = document.getElementById('reconnect-overlay');
@@ -230,6 +229,23 @@ if (isMobile) {
   }
 }
 
+// Floating notification helper for session status notices
+function showSessionNotice(text) {
+  let notice = document.getElementById('session-notice');
+  if (!notice) {
+    notice = document.createElement('div');
+    notice.id = 'session-notice';
+    notice.className = 'session-notice';
+    document.body.appendChild(notice);
+  }
+  notice.textContent = text;
+  notice.classList.add('visible');
+  clearTimeout(notice._timer);
+  notice._timer = setTimeout(() => {
+    notice.classList.remove('visible');
+  }, 3000);
+}
+
 // Setup WebSocket connection with reconnection logic
 function connectWebSocket() {
   if (reconnectTimer) {
@@ -259,47 +275,51 @@ function connectWebSocket() {
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'output') {
-        if (isReconnectingReplay) {
-          isReconnectingReplay = false;
-          // Calculate relative bottom-offset scroll restoration
-          const wasAtBottom = (term.buffer.active.viewportY === term.buffer.active.baseY);
-          const bottomOffset = Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY);
+        term.write(msg.data, updateJumpToBottomVisibility);
+      } else if (msg.type === 'replay') {
+        // (3) Explicit scrollback replay message
+        const wasAtBottom = (term.buffer.active.viewportY === term.buffer.active.baseY);
+        const bottomOffset = Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY);
 
-          // (2) Spec Fix: Clear corrupted escape state
-          term.reset();
+        // Clear corrupted escape state
+        term.reset();
 
-          term.write(msg.data, () => {
-            if (wasAtBottom) {
-              term.scrollToBottom();
-            } else {
-              const targetY = Math.max(0, term.buffer.active.baseY - bottomOffset);
-              term.scrollToLine(targetY);
-            }
-            updateJumpToBottomVisibility();
+        term.write(msg.data, () => {
+          if (wasAtBottom) {
+            term.scrollToBottom();
+          } else {
+            const targetY = Math.max(0, term.buffer.active.baseY - bottomOffset);
+            term.scrollToLine(targetY);
+          }
+          updateJumpToBottomVisibility();
 
-            // (2) Spec Fix: Force a TUI redraw via PTY resize bounce
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              const currentCols = term.cols;
-              const currentRows = term.rows;
-              ws.send(JSON.stringify({
-                type: 'resize',
-                cols: currentCols,
-                rows: Math.max(1, currentRows - 1)
-              }));
-              setTimeout(() => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                  ws.send(JSON.stringify({
-                    type: 'resize',
-                    cols: currentCols,
-                    rows: currentRows
-                  }));
-                }
-              }, 50);
-            }
-          });
-        } else {
-          term.write(msg.data, updateJumpToBottomVisibility);
-        }
+          // Force a TUI redraw via PTY resize bounce
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const currentCols = term.cols;
+            const currentRows = term.rows;
+            ws.send(JSON.stringify({
+              type: 'resize',
+              cols: currentCols,
+              rows: Math.max(1, currentRows - 1)
+            }));
+            setTimeout(() => {
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: 'resize',
+                  cols: currentCols,
+                  rows: currentRows
+                }));
+              }
+            }, 50);
+          }
+        });
+      } else if (msg.type === 'session-new') {
+        // (2) Show notice for new session
+        term.write('\r\n\x1b[36m[New session started]\x1b[0m\r\n');
+        showSessionNotice('New session started');
+      } else if (msg.type === 'session-resumed') {
+        // (2) Show notice for resumed session
+        showSessionNotice('Session resumed');
       } else if (msg.type === 'exit') {
         term.write(`\r\n\x1b[33m[Shell exited — ${msg.shell || activeShell} returned code ${msg.code}]\x1b[0m\r\n`);
         term.write(`\x1b[32m[Use the dropdown at the top to spawn another shell or reconnect]\x1b[0m\r\n`);
@@ -397,7 +417,6 @@ function handleReconnect() {
 
   const delay = BACKOFF_DELAYS[reconnectAttempts];
   reconnectAttempts++;
-  isReconnectingReplay = true;
 
   if (reconnectOverlay) {
     reconnectOverlay.classList.remove('hidden');
@@ -422,7 +441,6 @@ if (reconnectBtn) {
   reconnectBtn.addEventListener('click', (e) => {
     e.preventDefault();
     reconnectAttempts = 0;
-    isReconnectingReplay = true;
     if (reconnectStatus) {
       reconnectStatus.textContent = "Reconnecting...";
     }
@@ -442,7 +460,6 @@ document.addEventListener('visibilitychange', () => {
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       console.log("App visibility restored. Reconnecting WebSocket...");
       reconnectAttempts = 0;
-      isReconnectingReplay = true;
       connectWebSocket();
     }
   }
@@ -452,7 +469,6 @@ window.addEventListener('online', () => {
   if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
     console.log("Network online. Checking WebSocket connection...");
     reconnectAttempts = 0;
-    isReconnectingReplay = true;
     connectWebSocket();
   }
 });

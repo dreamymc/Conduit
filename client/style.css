@@ -280,6 +280,32 @@ body.login-page {
   }
 }
 
+/* Floating Session Notice */
+.session-notice {
+  position: fixed;
+  top: 52px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-10px);
+  background: rgba(13, 17, 23, 0.92);
+  color: #58a6ff;
+  border: 1px solid rgba(88, 166, 255, 0.4);
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-family: 'Outfit', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  z-index: 10000;
+  pointer-events: none;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.session-notice.visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
 /* Reconnection Overlay styling */
 .overlay {
   position: fixed;
